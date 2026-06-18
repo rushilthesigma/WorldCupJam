@@ -49,9 +49,8 @@ export const SPRINT_MULT = 1.45;
 export const GK_SPEED = 74; // keepers stay sharp so shots get saved — buffed a touch so they set and dive a hair quicker
 export const PLAYER_ACCEL = 240; // px/s^2 — gives players weight/momentum
 
-// Control / switching / marking.
-export const AUTOSWITCH_HYST = 60;     // nearest player must be this much closer to the ball before auto-switching
-export const AUTOSWITCH_COOLDOWN = 1.5; // seconds between automatic switches (prevents rapid flip-flopping)
+// Control / marking. On defense the human clicks the man they want (or flicks the
+// kick toward him — see switchPick) — there is no automatic player switching.
 export const MARK_DIST = 16; // how far goal-side a defender sits off their man
 
 // Kicking. The human's mouse kick spans this whole range via charge: a light
@@ -76,14 +75,14 @@ export const PASS_MAGNET_MAX = 34;
 // briefly committed (cooldown) while the carrier escapes. That trade is what
 // makes a steal feel earned instead of random, and keeps possession on the pitch
 // longer for both sides.
-export const STEAL_RANGE = 16; // a lunge that lands within this of the carrier can win it
+export const STEAL_RANGE = 18; // a lunge that lands within this of the carrier can win it
 export const STEAL_LUNGE_TIME = 0.24; // active window of a lunge — the steal connects during this
 export const STEAL_LUNGE_SPEED = 122; // forward burst speed while lunging (a real dart)
 export const STEAL_COOLDOWN = 0.65; // wait before you can lunge again (a whiff costs you)
 export const STEAL_CHANCE = 0.5; // a challenge in range is a coin flip — 50/50 win it or lose it
-export const STEAL_FAIL_HOLD = 1.08; // lose the coin flip and the carrier is protected this long (can't be robbed again)
+export const STEAL_FAIL_HOLD = 0.85; // lose the coin flip and the carrier is protected this long (can't be robbed again)
 export const STEAL_PROMPT_RANGE = 65; // show the "press F" prompt when this close to the carrier
-export const STEAL_MAX_CHANCE = 0.78; // ceiling on human steal success — perfect timing gives 78%
+export const STEAL_MAX_CHANCE = 0.80; // ceiling on human steal success — perfect timing gives 80%
 export const AI_LUNGE_RATE = 0.97; // AI lunge attempts per second when in range (lower = you keep the ball longer)
 export const TACKLE_COOLDOWN = 0.4; // ball's grace window after any turnover
 export const POSSESSION_GRACE = 0.45; // a fresh receiver can't be robbed this long

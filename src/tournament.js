@@ -44,7 +44,7 @@ function poisson(lambda) {
 // Penalty shootout — best-of-5 then sudden death, conversion chance nudged by
 // OVR. Returns [aGoals, bGoals], always decisive.
 export function penShootout(aKey, bKey) {
-  const shot = (q) => Math.random() < 0.6 + (q - 75) * 0.004;
+  const shot = (q) => Math.random() < 0.6 + (q - 75) * 0.006;
   const qa = ovr(aKey);
   const qb = ovr(bKey);
   let sa = 0;
@@ -64,8 +64,8 @@ export function penShootout(aKey, bKey) {
 // each team also gets an independent random form factor so upsets are possible.
 export function simMatch(aKey, bKey, knockout = false) {
   const gap = ovr(aKey) - ovr(bKey);
-  const la = clamp(1.4 + gap * 0.04 + (Math.random() - 0.5) * 1.0, 0.25, 4.0);
-  const lb = clamp(1.4 - gap * 0.04 + (Math.random() - 0.5) * 1.0, 0.25, 4.0);
+  const la = clamp(1.4 + gap * 0.06 + (Math.random() - 0.5) * 0.52, 0.2, 4.5);
+  const lb = clamp(1.4 - gap * 0.06 + (Math.random() - 0.5) * 0.52, 0.2, 4.5);
   const a = poisson(la);
   const b = poisson(lb);
   const r = { a, b, pens: null, winner: null };
@@ -110,11 +110,12 @@ const GROUPS_2026 = [
 // ---------------------------------------------------------------------------
 // Creation
 // ---------------------------------------------------------------------------
-export function createTournament(youKey) {
+export function createTournament(youKey, subMap = {}) {
+  const sub = (k) => subMap[k] !== undefined ? subMap[k] : k;
   const groups = GROUPS_2026.map(([name, teams]) => ({
     name,
-    teams,
-    rows: teams.map((k) => ({ key: k, pld: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0, gd: 0, pts: 0 })),
+    teams: teams.map(sub),
+    rows: teams.map((k) => ({ key: sub(k), pld: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0, gd: 0, pts: 0 })),
     results: [],
   }));
 

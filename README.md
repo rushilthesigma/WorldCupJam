@@ -49,12 +49,28 @@ kicks**, like the real rules.
 - WebAudio sound effects (kick, pass, wall, goal, whistle) — no sound files
 - 3×5 bitmap font for the scoreboard
 
+## Saving your campaign
+
+World Cup and Road to the World Cup runs can be saved to one of **3 named
+slots** (single matches and Autoplay aren't campaigns, so they aren't saved).
+
+- **Save** — hit **SAVE** in the tournament/road hub and pick a slot.
+- **Load** — pick **LOAD GAME** on the mode screen to resume a saved run.
+- Once a run is bound to a slot it **auto-saves** after every matchweek, so the
+  slot always reflects your latest progress without re-saving by hand.
+
+Saves live in `localStorage` (key `wcjam.saves`), so they survive a reload but
+stay on the one device/browser. If storage is unavailable (private mode) the
+game just keeps going without a save.
+
 ## Code map
 
 - `src/constants.js` — pitch, speeds, timings, tuning
 - `src/teams.js` — country kit colours + procedural pixel flags
 - `src/font.js` — tiny bitmap font + text helpers
 - `src/audio.js` — WebAudio blips
+- `src/save.js` — localStorage save slots for campaigns
+- `src/wc.js` — World Cup / Road front-end, hub screens, save/load UI
 - `src/main.js` — input, entities, AI, physics, rendering, game loop
 
 ## Dev / testing hook
@@ -63,3 +79,6 @@ kicks**, like the real rules.
 `start()`, `skipKickoff()`, `tick(n)`, `setFreeze(bool)`, `placeBall(x,y,vx,vy)`
 for headless verification (the game advances via `requestAnimationFrame`, which
 browsers throttle in background tabs).
+
+Save slots also have hooks: `saveSlot(i)`, `loadSlot(i)`, `listSlots()`,
+`deleteSlot(i)` (0-indexed).

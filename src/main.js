@@ -24,8 +24,6 @@ import {
   SPRINT_MULT,
   GK_SPEED,
   PLAYER_ACCEL,
-  AUTOSWITCH_HYST,
-  AUTOSWITCH_COOLDOWN,
   MARK_DIST,
   KICK_MIN,
   KICK_MAX,
@@ -96,7 +94,9 @@ resize();
 
 // ---------------------------------------------------------------------------
 // Input — move with WASD / arrows, aim + kick with the mouse, and when
-// defending press F to lunge in for a steal. E switches player, Shift sprints.
+// defending, click the teammate you want to control (or flick the aim toward him;
+// E grabs the man nearest the ball as a fallback), or hold LMB next to a carrier
+// to time a steal. Shift sprints.
 // ---------------------------------------------------------------------------
 const keys = new Set();
 const pressed = new Set(); // edge-triggered, cleared each rendered frame
@@ -112,6 +112,7 @@ window.addEventListener("keydown", (e) => {
     if (controlsOpen) controlsOpen = false;
     else togglePause();
   }
+  if (k === " " && paused && !subOpen) togglePause();
   if (!keys.has(k)) pressed.add(k);
   keys.add(k);
   Sfx.resume();
@@ -177,6 +178,10 @@ canvas.addEventListener(
     } else if (state === STATE.WC) {
       e.preventDefault();
       WC.onWheel(e.deltaY > 0 ? 1 : -1);
+    } else if (state === STATE.PLAYING && pibOverVolume(mouseX, mouseY)) {
+      // Scroll over the speaker button to fine-tune master volume in small steps.
+      e.preventDefault();
+      Sfx.setMasterVol(clamp(Sfx.masterVol + (e.deltaY > 0 ? -0.1 : 0.1), 0, 1));
     }
   },
   { passive: false }
@@ -189,7 +194,22 @@ function togglePause() {
   if (state === STATE.PLAYING) {
     paused = !paused;
     if (!paused) controlsOpen = false;
-    Sfx.setCrowdMuted(paused); // silence the crowd while paused
+    syncCrowd(); // silence the crowd while paused
+  }
+}
+
+// The ambient crowd belongs to a live match only — it must fall silent on the
+// front-end/menus (title, team select, World Cup hub, full-time results) and
+// while paused. syncCrowd() is the single owner of the crowd mute: it's called
+// every update step and only pushes to the audio layer when the value flips, so
+// it never fights the per-frame setIntensity() ramp during play.
+const MATCH_STATES = new Set([STATE.KICKOFF, STATE.PLAYING, STATE.GOAL, STATE.HALFTIME]);
+let crowdMutedNow = null; // null => first sync always pushes the real value
+function syncCrowd() {
+  const muted = paused || !MATCH_STATES.has(state);
+  if (muted !== crowdMutedNow) {
+    crowdMutedNow = muted;
+    Sfx.setCrowdMuted(muted);
   }
 }
 
@@ -264,38 +284,41 @@ const NEUTRAL_ATTR = {
 };
 
 // Turn a 1-99 OVR into the handful of multipliers the simulation reads. Ranges
-// are intentionally narrow: a top side feels sharper (quicker, harder to rob,
-// keeper reacts faster) without making weaker teams unplayable.
+// are tuned so the OVR gap is clearly felt: a top side is noticeably sharper
+// (quicker, harder to rob, keeper reacts faster) and a weak side noticeably
+// blunter — without tipping into "unplayable" at the bottom of the band.
 function attrsFromOvr(ovr, line) {
   const q = clamp((ovr - OVR_MIN) / (OVR_MAX - OVR_MIN), 0, 1);
   if (line === "GK") {
     return {
-      speed: lerp(0.95, 1.1, q),
+      speed: lerp(0.92, 1.14, q),
       shoot: 1,
-      tackle: lerp(0.85, 1.15, q),
+      tackle: lerp(0.8, 1.25, q),
       control: 1, // keepers claim with gkReach, not the outfield touch radius
-      gkReaction: lerp(GK_REACTION * 1.3, GK_REACTION * 0.72, q), // better = quicker
-      gkReach: lerp(GK_REACH * 0.9, GK_REACH * 1.16, q),
+      gkReaction: lerp(GK_REACTION * 1.45, GK_REACTION * 0.62, q), // better = quicker
+      gkReach: lerp(GK_REACH * 0.85, GK_REACH * 1.22, q),
     };
   }
   return {
-    speed: lerp(0.93, 1.1, q),
-    shoot: lerp(0.9, 1.14, q),
-    tackle: lerp(0.8, 1.25, q),
-    control: lerp(0.95, 1.3, q), // better players take a pass cleanly from farther out
+    speed: lerp(0.88, 1.15, q),
+    shoot: lerp(0.84, 1.2, q),
+    tackle: lerp(0.72, 1.35, q),
+    control: lerp(0.88, 1.4, q), // better players take a pass cleanly from farther out
     gkReaction: GK_REACTION,
     gkReach: GK_REACH,
   };
 }
 
 // How well a team protects the ball: the chance (0..1) that one of their passes
-// survives a challenge, or that a dribbler shrugs off a steal attempt — read
-// straight off the team OVR ("a percentage chance of your OVR"). Classic mode
-// (no squad, ovr 0) falls back to a 50/50 baseline ("half the time"). Capped so
-// even an elite side is never a literal sure thing.
+// survives a challenge, or that a dribbler shrugs off a steal attempt. Anchored
+// on the neutral 78 OVR, with each point swinging retention by ~1.5% — so the
+// gap between a weak and an elite side bites harder than a flat "OVR as a
+// percentage" would. Classic mode (no squad, ovr 0) falls back to a 50/50
+// baseline ("half the time"). Capped both ends so it's never a literal sure
+// thing — or a literal giveaway.
 function ovrGuard(ovr) {
   if (!ovr) return 0.5;
-  return clamp(ovr / 100, 0.5, 0.95);
+  return clamp(0.78 + (ovr - 78) * 0.015, 0.45, 0.96);
 }
 
 // Radius (px) within which the intended receiver of YOUR pass auto-collects the
@@ -377,8 +400,16 @@ let autoPlay = false; // true in AI-vs-AI autoplay mode
 
 // --- Team-select / squad menu state (only used when FEATURE.teamSelect) ---
 let selStage = "home"; // "home" → "away" → "kit" within TEAM_SELECT
+let selectForAuto = false; // team-select was entered for AUTOPLAY (AI vs AI) instead of Quick Play
 let leftKitType = "home"; // kit worn by left team ("home" | "away")
 let rightKitType = "home"; // kit worn by right team
+let afcQualifier = false; // current match is a Road-to-the-World-Cup qualifier (any confederation)
+let roadConfed = null; // confederation code for the badge ("AFC"|"CAF"|...) during a road match
+let roadYouHome = true; // in a qualifier: are YOU the home side? (false => you're the away/road team)
+// You always play from the left on the pitch, but the HOST is the home team. On a
+// road game we flip the scoreboard to read host-first, so your team shows on the
+// right as the visiting side — and the crowd backs the right (host) team.
+const roadAway = () => afcQualifier && !roadYouHome;
 let kitInputDone = false; // guard: kit stage processes input once per render frame
 let gridCursor = 0; // highlighted cell index into NATION_KEYS (0..7)
 let pickedHome = null; // chosen home/your-team key
@@ -391,7 +422,6 @@ let squadSel = 0; // selected row: 0..10 players, 11 = START / CLOSE
 let squadPickBench = -1; // >=0 while choosing a same-line bench player to bring on
 
 let controlled = null;
-let lastAutoSwitchTime = -Infinity;
 let charge = 0;
 let chargeDir = 1; // shot meter ping-pongs: +1 filling, -1 draining
 let passInFlight = false;
@@ -409,13 +439,15 @@ let halftimeDone = false;
 let stoppageTime = 0; // extra real seconds added at 90' before full time is blown
 let unluckyFlash = { t: 0, x: 0, y: 0 };
 const UNLUCKY_DURATION = 0.85;
+let stealFlash = { t: 0, x: 0, y: 0 };
+const STEAL_FLASH_DURATION = 0.9;
 
 const isLeft = (p) => p && p.teamKey === leftKey;
 
 // Start a match. With no arguments this is the classic neutral BRA-vs-ARG game
 // (also used for replays). The team-select flow calls it with the chosen keys,
 // edited starting elevens, and their benches.
-function setupMatch(lk = leftKey, rk = rightKey, squadMatch = false, lKit = "home", rKit = "home", tourney = false) {
+function setupMatch(lk = leftKey, rk = rightKey, squadMatch = false, lKit = "home", rKit = "home", tourney = false, roadHome = false, roadConfedArg = "AFC", youHome = true) {
   leftKey = lk;
   rightKey = rk;
   leftKitType = lKit;
@@ -437,7 +469,6 @@ function setupMatch(lk = leftKey, rk = rightKey, squadMatch = false, lKit = "hom
   scoreL = 0;
   scoreR = 0;
   clock = 0;
-  lastAutoSwitchTime = -Infinity;
   halftimeDone = false;
   stoppageTime = 0;
   winnerText = "";
@@ -445,14 +476,27 @@ function setupMatch(lk = leftKey, rk = rightKey, squadMatch = false, lKit = "hom
   controlsOpen = false;
   pibCollapsed = false;
   subOpen = false;
-  Sfx.setCrowdMuted(false);
+  // Road-to-the-World-Cup qualifying is a raucous home ground: pack the stands
+  // louder and badge the scoreboard with the confederation. Reset to baseline.
+  afcQualifier = !!roadHome;
+  roadConfed = roadHome ? (roadConfedArg || "AFC") : null;
+  roadYouHome = youHome;
+  Sfx.setCrowdBoost(roadHome ? 1.7 : 1);
   // Fresh sponsor draw + stadium rebuild for the new match (10 of 64 brands).
   rollSponsors();
-  stadiumType = matchCount % 3;
+  // Asian Qualifier (type 3) is the dedicated Road-to-the-World-Cup ground; it
+  // never appears in the normal rotation. A dev-mode quick play also pins it.
+  stadiumType = forcedStadiumType != null ? forcedStadiumType : roadHome ? 3 : matchCount % 3;
   matchCount++;
   // Dress the stands in the two nations' colours — home support fills the left
-  // half of the bowl, away support the right, split down the halfway line.
-  stadium = buildStadium(teamCrowdPalette(lk), teamCrowdPalette(rk), stadiumType);
+  // half of the bowl, away support the right, split down the halfway line. A
+  // Road qualifier packs the WHOLE bowl with the HOST nation's support: yours
+  // when you're home, the opponent's when you're away.
+  const youColors = teamCrowdPalette(lk);
+  const oppColors = teamCrowdPalette(rk);
+  const homeMix = roadHome ? (youHome ? youColors : oppColors) : youColors;
+  const awayMix = roadHome ? homeMix : oppColors;
+  stadium = buildStadium(homeMix, awayMix, stadiumType);
   kickoff("L");
 }
 
@@ -464,26 +508,30 @@ function rematch() {
   Sfx.whistle();
 }
 
-// Pick two different random nations and start an AI-vs-AI match.
-function startAutoPlay() {
-  autoPlay = true;
-  const lk = NATION_KEYS[((Math.random() * NATION_KEYS.length) | 0)];
-  let rk;
-  do { rk = NATION_KEYS[((Math.random() * NATION_KEYS.length) | 0)]; } while (rk === lk);
-  const rKit = kitAutoRight(lk, "home", rk);
-  setupMatch(lk, rk, true, "home", rKit);
+// Launch the match chosen on the team-select screen. selectForAuto decides
+// whether it runs as AI-vs-AI (AUTOPLAY) or as a normal Quick Play match.
+function launchSelectedMatch() {
+  autoPlay = selectForAuto;
+  setupMatch(pickedHome, pickedAway, true, leftKitType, rightKitType);
 }
 
 // World Cup tournament controller. It owns the Mode Select, nation pick and
 // tournament hub screens (state STATE.WC) and calls back here to launch matches.
 const WC = createWorldCup({
-  startMatch: (you, opp, knockout) => {
-    const rKit = kitAutoRight(you, "home", opp);
-    setupMatch(you, opp, true, "home", rKit, true); // squad match (OVR + subs) + tournament
+  startMatch: (you, opp, knockout, roadHome = false, roadConfed = "AFC", youHome = true) => {
+    // Away qualifiers: you wear your change kit and the host's crowd fills the
+    // bowl. Home games (and every WC match) keep your home kit.
+    const lKit = roadHome && !youHome ? "away" : "home";
+    const rKit = kitAutoRight(you, lKit, opp);
+    // roadHome: a Road-to-the-World-Cup qualifier — confederation ground; youHome
+    // decides whose support packs the stands.
+    setupMatch(you, opp, true, lKit, rKit, true, roadHome, roadConfed, youHome); // squad match (OVR + subs) + tournament
   },
-  quickPlay: () => { autoPlay = false; enterTeamSelect(); },
-  toTitle: () => { autoPlay = false; state = STATE.TITLE; },
-  autoPlay: () => startAutoPlay(),
+  quickPlay: () => { autoPlay = false; enterTeamSelect(false); },
+  toTitle: () => { autoPlay = false; forcedStadiumType = null; state = STATE.TITLE; },
+  // AUTOPLAY uses the same nation-pick screen as Quick Play; it just runs the
+  // chosen matchup as AI vs AI.
+  autoPlay: () => { autoPlay = false; enterTeamSelect(true); },
   sfx: {
     pass: () => Sfx.pass(),
     whistle: () => Sfx.whistle(),
@@ -589,12 +637,14 @@ function update(dt) {
   mouseMoved = false;
 }
 function _update(dt) {
+  syncCrowd(); // crowd ambience tracks live-match state (silent on menus/pause)
   if (state === STATE.TITLE || state === STATE.FULLTIME) {
     Sfx.setIntensity(0); // resting murmur
-    // Autoplay: count down then start a fresh random match; ESC exits to menu.
+    // Autoplay full time: R replays the same two teams (still AI vs AI), ENTER
+    // returns to the nation-pick screen for two new teams, ESC exits to menu.
     if (state === STATE.FULLTIME && autoPlay) {
-      stateTimer -= dt;
-      if (stateTimer <= 0 || keyPressed("start")) { startAutoPlay(); return; }
+      if (keyPressed("rematch")) { rematch(); return; }
+      if (keyPressed("start")) { autoPlay = false; enterTeamSelect(true); return; }
       if (keyPressed("back")) { autoPlay = false; WC.enter(); state = STATE.WC; pressed.delete("escape"); }
       return;
     }
@@ -615,9 +665,28 @@ function _update(dt) {
       rematch();
       return;
     }
+    // Dev wrench (title screen only): password-gated Quick Play in the Asian
+    // Qualifier ground. Checked before PLAY so the corner click can't fall
+    // through to the menu.
+    if (state === STATE.TITLE && clickPending &&
+        clickX >= DEV_BTN.x && clickX <= DEV_BTN.x + DEV_BTN.w &&
+        clickY >= DEV_BTN.y && clickY <= DEV_BTN.y + DEV_BTN.h) {
+      clickPending = false;
+      const entry = (typeof window !== "undefined" && window.prompt)
+        ? window.prompt("Dev mode — enter password:")
+        : null;
+      if (entry === DEV_PASSWORD) {
+        forcedStadiumType = 3; // pin the dev-only Asian Qualifier ground
+        autoPlay = false;
+        Sfx.whistle();
+        enterTeamSelect(false); // Quick Play: pick teams, then kick off in it
+      }
+      return;
+    }
     const titleClicked = clickPending && clickX >= VIEW_W / 2 - 120 && clickX <= VIEW_W / 2 + 120 && clickY >= 178 && clickY <= 234;
     if (keyPressed("start") || titleClicked) {
       Sfx.whistle();
+      forcedStadiumType = null; // normal play never uses the dev stadium
       if (FEATURE.teamSelect) {
         WC.enter(); // choose Quick Play or World Cup
         state = STATE.WC;
@@ -697,6 +766,7 @@ function _update(dt) {
   clock += dt;
   if (setpieceTimer > 0) setpieceTimer -= dt;
   if (unluckyFlash.t > 0) unluckyFlash.t -= dt;
+  if (stealFlash.t > 0) stealFlash.t -= dt;
   if (!halftimeDone && clock >= MATCH_SECONDS / 2) {
     triggerHalftime();
     return;
@@ -860,20 +930,10 @@ function updateControl() {
   if (weHaveBall) {
     controlled = ball.owner;
     passInFlight = false;
-  } else if (!passInFlight) {
-    // Auto-switch: hand control to the player best placed to win the ball.
-    // Only fires when the nearest player is significantly closer (AUTOSWITCH_HYST)
-    // AND enough time has passed since the last switch (AUTOSWITCH_COOLDOWN),
-    // so 2nd-closest doesn't trigger a switch every few seconds.
-    const near = nearestField(left, ball.x, ball.y);
-    if (near && near !== controlled && clock - lastAutoSwitchTime >= AUTOSWITCH_COOLDOWN) {
-      const dCur = controlled && isLeft(controlled) ? dist(controlled, ball) : Infinity;
-      if (dCur - dist(near, ball) > AUTOSWITCH_HYST) {
-        controlled = near;
-        lastAutoSwitchTime = clock;
-      }
-    }
   }
+  // Defending: NO auto-switch. You keep the man you've got and change men only by
+  // the kicking motion — wind up the meter and flick it toward the teammate you
+  // want (see handleHumanInput / switchTowardAim), or tap E for the nearest man.
 
   // Manual switch — always jump to the player nearest the ball, now.
   if (keyPressed("switch")) {
@@ -888,6 +948,50 @@ function updateControl() {
 function switchPlayer() {
   const c = nearestField(left, ball.x, ball.y);
   if (c) controlled = c;
+}
+
+// The teammate a switch-flick aims at: the nearest man inside a cone around the
+// aim direction (ux,uy from p), falling back to the most-aligned man if the cone
+// is empty. Shared by the input handler and the aim preview so they agree.
+function switchTarget(p, ux, uy) {
+  let best = null, bestD = Infinity, bestAlign = -2, bestAny = null;
+  for (const t of left) {
+    if (t === p || t.role === "GK") continue;
+    const dx = t.x - p.x, dy = t.y - p.y;
+    const d = len(dx, dy) || 1;
+    const align = (dx / d) * ux + (dy / d) * uy; // -1..1, how "toward" the aim
+    if (align > bestAlign) { bestAlign = align; bestAny = t; }
+    if (align >= 0.5 && d < bestD) { bestD = d; best = t; } // within ~60° cone
+  }
+  return best || bestAny;
+}
+
+// The outfielder under the cursor, if any (forgiving radius — the sprites are
+// only ~6px wide, so allow a comfortable click target).
+function manUnderCursor(p) {
+  let best = null, bestD = 14;
+  for (const t of left) {
+    if (t === p || t.role === "GK") continue;
+    const d = len(t.x - mouseX, t.y - mouseY);
+    if (d < bestD) { bestD = d; best = t; }
+  }
+  return best;
+}
+
+// Who a switch-release hands control to: the man you clicked ON if the cursor is
+// over one, otherwise the man the kick was flicked TOWARD. Shared by the input
+// handler and the aim preview so the ring always shows who you'll actually get.
+function switchPick(p) {
+  const onMan = manUnderCursor(p);
+  if (onMan) return onMan;
+  const a = aimVec(p);
+  const l = len(a.x, a.y) || 1;
+  return switchTarget(p, a.x / l, a.y / l);
+}
+
+function switchTowardAim(p) {
+  const pick = switchPick(p);
+  if (pick) controlled = pick;
 }
 
 // Flip every player to the opposite end — called once at half time.
@@ -909,7 +1013,7 @@ function swapSides() {
 const STEAL_GOLD_CENTER = 0.80; // where the gold zone is centred on the meter (80% of CHARGE_TIME)
 
 // Half-width of the gold zone: wider for better tacklers, narrower vs stronger carriers.
-// Range roughly 4–12% of the bar — hard but not pixel-perfect.
+// Range roughly 7–16% of the bar — forgiving but still a timed press.
 function stealGoldHalfWidth(challenger, carrier) {
   const cQ = challenger.ovr > 0
     ? clamp((challenger.ovr - OVR_MIN) / (OVR_MAX - OVR_MIN), 0, 1)
@@ -917,7 +1021,7 @@ function stealGoldHalfWidth(challenger, carrier) {
   const oQ = carrier && carrier.ovr > 0
     ? clamp((carrier.ovr - OVR_MIN) / (OVR_MAX - OVR_MIN), 0, 1)
     : 0.5;
-  return lerp(0.06, 0.13, cQ) * lerp(1.15, 0.85, oQ);
+  return lerp(0.085, 0.16, cQ) * lerp(1.15, 0.85, oQ);
 }
 
 // ---------------------------------------------------------------------------
@@ -951,14 +1055,18 @@ function handleHumanInput(dt) {
 
   const hasBall = ball.owner === p;
 
-  const nearCarrier = !hasBall && ball.owner &&
+  // Standing next to an opponent carrier: left-click is a timed steal.
+  const byCarrier = !hasBall && ball.owner &&
     ball.owner.teamKey !== p.teamKey &&
-    len(ball.owner.x - p.x, ball.owner.y - p.y) < STEAL_PROMPT_RANGE &&
-    p.lungeT <= 0 && p.lungeCd <= 0;
+    len(ball.owner.x - p.x, ball.owner.y - p.y) < STEAL_PROMPT_RANGE;
+  const nearCarrier = byCarrier && p.lungeT <= 0 && p.lungeCd <= 0;
+  // Off the ball, left-click is a player switch: wind up the kick and flick it
+  // toward the teammate you want — control jumps to him on release.
+  const switchAim = !hasBall && !byCarrier && p.lungeT <= 0;
 
-  // Left-click is context-sensitive: charges a kick when you have the ball,
-  // or a steal attempt when you're defending next to a carrier.
-  if (mouseShoot && (hasBall || nearCarrier)) {
+  // Left-click is context-sensitive: charges a kick when you have the ball, a
+  // steal next to a carrier, or a switch-flick when you're off the ball.
+  if (mouseShoot && (hasBall || nearCarrier || switchAim)) {
     charge += chargeDir * dt;
     if (charge >= CHARGE_TIME) { charge = CHARGE_TIME; chargeDir = -1; }
     else if (charge <= 0) { charge = 0; chargeDir = 1; }
@@ -983,6 +1091,8 @@ function handleHumanInput(dt) {
       const hw = stealGoldHalfWidth(p, ball.owner);
       const timingQuality = Math.max(0, 1 - Math.abs(t - STEAL_GOLD_CENTER) / hw);
       tryLunge(p, timingQuality);
+    } else {
+      switchTowardAim(p); // flicked the kick toward a teammate — take control of him
     }
     charge = 0;
     chargeDir = 1;
@@ -1707,7 +1817,7 @@ function resolveSteals() {
     if (p.teamKey === o.teamKey || p.lungeT <= 0 || p.lungeHit) continue;
     if (len(p.x - o.x, p.y - o.y) >= STEAL_RANGE) continue;
     p.lungeHit = true; // one go at it per lunge
-    // Human: chance scales with timing quality — perfect centre = STEAL_MAX_CHANCE (65%),
+    // Human: chance scales with timing quality — perfect centre = STEAL_MAX_CHANCE (80%),
     //        edge of gold zone = 0%. AI: existing ovrGuard + tackle formula.
     const isHuman = p.lungeTimingScore >= 0;
     const succeeded = isHuman
@@ -1719,6 +1829,7 @@ function resolveSteals() {
         unluckyFlash = { t: UNLUCKY_DURATION, x: p.x, y: p.y };
       return;
     }
+    if (isHuman) stealFlash = { t: STEAL_FLASH_DURATION, x: p.x, y: p.y };
     // Won it: knock the ball to the challenger's side so they collect it.
     const ang = Math.atan2(p.y - o.y, p.x - o.x);
     ball.owner = null;
@@ -1863,13 +1974,15 @@ function score(side) {
   goalText = (side === "L" ? teamData(leftKey).abbr : teamData(rightKey).abbr) + " GOAL!";
   state = STATE.GOAL;
   stateTimer = GOAL_CELEBRATION;
-  Sfx.goal();
+  // In qualifying the whole bowl is the HOST nation's support, so it only roars
+  // for the side at home — you (left) when home, the opponent (right) when you're
+  // away. Neutral grounds (World Cup, Quick Play) cheer either goal.
+  Sfx.goal(!afcQualifier || side === (roadYouHome ? "L" : "R"));
 }
 
 function endMatch() {
   state = STATE.FULLTIME;
   Sfx.whistle();
-  if (autoPlay) { stateTimer = 4.0; }
   // A tournament match shows the tie's outcome (resolving a knockout draw on
   // penalties); the hub records it when the player presses ENTER.
   if (inTournament) {
@@ -1897,6 +2010,15 @@ const BALL_TRAIL_LEN = 10;
 let stadium = null;
 let matchCount = 0;
 let stadiumType = 0;
+
+// --- Dev mode ---------------------------------------------------------------
+// The Asian Qualifier ground (stadium type 3) is dev-only: it never shows up in
+// the normal stadium rotation. A wrench on the title screen, behind a password,
+// pins it (forcedStadiumType = 3) and drops you into a Quick Play match in it.
+// Change DEV_PASSWORD to whatever you like.
+const DEV_PASSWORD = "wcj2026";
+let forcedStadiumType = null; // when set, overrides the per-match stadium type
+const DEV_BTN = { x: VIEW_W - 30, y: VIEW_H - 30, w: 22, h: 22 }; // title-screen wrench
 function render() {
   if (!stadium)
     stadium = buildStadium(teamCrowdPalette(leftKey), teamCrowdPalette(rightKey), stadiumType);
@@ -1911,6 +2033,7 @@ function render() {
     for (const p of players) drawPlayer(p);
     drawShotTracker();
     drawBall();
+    drawDefenseAim();
     drawHud();
   }
   drawOverlays();
@@ -1960,10 +2083,13 @@ function teamCrowdPalette(key) {
 
 // homeMix dresses the left half of the bowl, awayMix the right; default to one
 // neutral mix everywhere when called bare.
-// Three stadium types cycle each match:
-//   0 = Classic Bowl   — dark navy, rectangular stands, corner floodlight pylons
-//   1 = Open Corners   — warm concrete, stands only on straights (Copa-style gaps)
-//   2 = Modern Night   — cool blue, LED roof rim, blue-tinted floodlight glow
+// Four stadium types cycle each match:
+//   0 = Classic Bowl    — dark navy, rectangular stands, corner floodlight pylons
+//   1 = Open Corners    — warm concrete, stands only on straights (Copa-style gaps)
+//   2 = Modern Night    — cool blue, LED roof rim, blue-tinted floodlight glow
+//   3 = Asian Qualifier — compact ground: a shallow ring of stands, clean end
+//                         lines, and 2 sponsor boards per touchline (top +
+//                         bottom), so it reads as a smaller venue
 function buildStadium(homeMix = FAN_MIX, awayMix = homeMix, type = 0) {
   const cv = document.createElement("canvas");
   cv.width = VIEW_W;
@@ -1979,9 +2105,21 @@ function buildStadium(homeMix = FAN_MIX, awayMix = homeMix, type = 0) {
   const bx1 = gx1 + BOARD, by1 = gy1 + BOARD;
 
   // Structural palette per type.
-  const BG   = type === 2 ? "#040710" : "#080b13";
-  const BASE = type === 2 ? "#080c1c" : "#0e1322";
+  const BG   = type === 2 ? "#040710" : type === 3 ? "#0a0c10" : "#080b13";
+  const BASE = type === 2 ? "#080c1c" : type === 3 ? "#1b2024" : "#0e1322";
   const ISLE = type === 2 ? "#162038" : "#2a3146";
+
+  // Type 3 (Asian Qualifier) is a compact ground: the crowd sits in a shallow
+  // ring around the pitch with open/dark ground beyond, so the venue reads as
+  // smaller. standDepth caps how far the terracing + crowd extend out from the
+  // boards; the other types fill the full margin to the screen edge (Infinity,
+  // which collapses the band test to "always inside" below).
+  const standDepth = type === 3 ? 12 : Infinity;
+  const bandX0 = Math.max(0, bx0 - standDepth);
+  const bandX1 = Math.min(VIEW_W, bx1 + standDepth);
+  const bandY0 = Math.max(0, by0 - standDepth);
+  const bandY1 = Math.min(VIEW_H, by1 + standDepth);
+  const inBand = (x, y) => x >= bandX0 && x <= bandX1 && y >= bandY0 && y <= bandY1;
 
   g.fillStyle = BG;
   g.fillRect(0, 0, VIEW_W, VIEW_H);
@@ -2003,12 +2141,12 @@ function buildStadium(homeMix = FAN_MIX, awayMix = homeMix, type = 0) {
   g.fillStyle = BASE;
   for (let y = 0; y < VIEW_H; y += 2)
     for (let x = 0; x < VIEW_W; x += 2)
-      if (x < bx0 || x > bx1 || y < by0 || y > by1) g.fillRect(x, y, 2, 2);
+      if ((x < bx0 || x > bx1 || y < by0 || y > by1) && inBand(x, y)) g.fillRect(x, y, 2, 2);
 
   // --- Sideline board layout (constants also used below to draw the actual boards). ---
   // margin=0, gap=0: boards run flush edge-to-edge with no railing gaps.
   // FIFA WC 2026 is always pinned at the first board on each sideline (by rollSponsors).
-  const margin = 0, gap = 0, perSide = 4, SBH = 12;
+  const margin = 0, gap = 0, perSide = type === 3 ? 2 : 4, SBH = 12;
   const boardW = (gx1 - gx0 - 2 * margin - (perSide - 1) * gap) / perSide;
 
   // Pre-compute x-ranges that have NO sponsor board (margins + inter-board gaps).
@@ -2036,7 +2174,7 @@ function buildStadium(homeMix = FAN_MIX, awayMix = homeMix, type = 0) {
     for (let gx = 0; gx < VIEW_W; gx += STEP_X) {
       const x = gx + stag, y = gy;
       const cx = x + 1, cy = y + 1;
-      if (!inStands(cx, cy)) continue;
+      if (!inStands(cx, cy) || !inBand(cx, cy)) continue;
       const d = depth(cx, cy);
       if (Math.random() < emptyChance) continue;
       const mix = cx < FIELD.cx ? homeMix : awayMix;
@@ -2062,28 +2200,34 @@ function buildStadium(homeMix = FAN_MIX, awayMix = homeMix, type = 0) {
     g.globalAlpha = 1;
   }
 
-  // --- Exit tunnels (vomitories). ---
-  for (let i = 1; i <= 5; i++) {
-    const ex = gx0 + ((gx1 - gx0) * i) / 6;
-    drawExit(g, ex - 4, 3, 8, by0 - 6, "down");
-    drawExit(g, ex - 4, by1 + 3, 8, VIEW_H - (by1 + 3) - 3, "up");
+  // --- Exit tunnels (vomitories). Confined to the stand band so a compact
+  // (type-3) ground gets short tunnels in its shallow ring and fewer of them. ---
+  const exN = type === 3 ? 3 : 5;
+  for (let i = 1; i <= exN; i++) {
+    const ex = gx0 + ((gx1 - gx0) * i) / (exN + 1);
+    drawExit(g, ex - 4, bandY0 + 3, 8, by0 - bandY0 - 6, "down");
+    drawExit(g, ex - 4, by1 + 3, 8, bandY1 - (by1 + 3) - 3, "up");
   }
   for (const ey of [FIELD.cy - 100, FIELD.cy + 100]) {
-    drawExit(g, 3, ey - 5, bx0 - 6, 10, "right");
-    drawExit(g, bx1 + 3, ey - 5, VIEW_W - (bx1 + 3) - 3, 10, "left");
+    drawExit(g, bandX0 + 3, ey - 5, bx0 - bandX0 - 6, 10, "right");
+    drawExit(g, bx1 + 3, ey - 5, bandX1 - (bx1 + 3) - 3, 10, "left");
   }
 
   if (gameSponsors.length < 10) rollSponsors();
 
-  drawGoalBoard(g, 12, FIELD.cy, 17, 150, gameSponsors[0]);
-  drawGoalBoard(g, VIEW_W - 12, FIELD.cy, 17, 150, gameSponsors[1]);
+  // Goal-line billboards behind each goal — every venue except the compact
+  // Asian Qualifier ground (type 3), which keeps its end lines clean.
+  if (type !== 3) {
+    drawGoalBoard(g, 12, FIELD.cy, 17, 150, gameSponsors[0]);
+    drawGoalBoard(g, VIEW_W - 12, FIELD.cy, 17, 150, gameSponsors[1]);
+  }
 
-
-  // --- Sideline brand boards. ---
+  // --- Sideline brand boards along the top and bottom touchlines. ---
+  // The Asian Qualifier ground carries 2 per side; the bigger venues carry 4.
   for (let i = 0; i < perSide; i++) {
     const sbx = gx0 + margin + i * (boardW + gap);
     drawSideBoard(g, sbx, gy0 - SBH, boardW, SBH, gameSponsors[2 + i]);
-    drawSideBoard(g, sbx, gy1, boardW, SBH, gameSponsors[6 + i]);
+    drawSideBoard(g, sbx, gy1, boardW, SBH, gameSponsors[2 + perSide + i]);
   }
 
   g.fillStyle = "#0c5a22";
@@ -2171,6 +2315,27 @@ function drawExit(g, x, y, w, h, mouth) {
     g.fillStyle = "rgba(150,135,90,0.22)"; g.fillRect(x, y, 5, h);
     g.fillStyle = "#46f08a"; g.fillRect(x, y + (h >> 1) - 1, 2, 2);
   }
+}
+
+// A small open-end wrench glyph (drawn as vectors) for the title-screen dev
+// affordance: a diagonal shaft with an open jaw at the head.
+function drawWrench(g, cx, cy, s, color) {
+  g.save();
+  g.translate(Math.round(cx), Math.round(cy));
+  g.rotate(-Math.PI / 4); // lie the wrench diagonally
+  g.fillStyle = color;
+  g.strokeStyle = color;
+  g.lineCap = "round";
+  // Shaft.
+  const shaftW = s * 0.24;
+  g.fillRect(-shaftW / 2, -s * 0.08, shaftW, s * 0.6);
+  // Open jaw at the head: a C-ring with a gap facing outward.
+  g.lineWidth = s * 0.24;
+  g.beginPath();
+  g.arc(0, -s * 0.28, s * 0.26, Math.PI * 0.72, Math.PI * 2.28);
+  g.stroke();
+  g.restore();
+  g.globalAlpha = 1;
 }
 
 // Mouse-aimed shot tracker: a dotted predicted trajectory toward the cursor,
@@ -2374,9 +2539,43 @@ function drawPlayer(p) {
   ctx.fillRect(Math.round(x + (p.faceX / fl) * 2), Math.round(y - 3 + (p.faceY / fl) * 1), 1, 1);
 }
 
+// Switch-flick aim preview: while you hold the meter off the ball, draw a dotted
+// line from your man toward the cursor and ring the teammate the flick would hand
+// control to — so you can see who you'll get before you let go.
+function drawDefenseAim() {
+  if (autoPlay || state !== STATE.PLAYING || !controlled) return;
+  if (!mouseShoot || charge <= 0) return;
+  const p = controlled;
+  const hasBall = ball.owner === p;
+  const byCarrier = !hasBall && ball.owner && ball.owner.teamKey !== p.teamKey &&
+    len(ball.owner.x - p.x, ball.owner.y - p.y) < STEAL_PROMPT_RANGE;
+  if (hasBall || byCarrier || p.lungeT > 0) return; // kick / steal / committed — not a switch
+  const a = aimVec(p);
+  const l = len(a.x, a.y) || 1;
+  const ux = a.x / l, uy = a.y / l;
+  // Dotted wind-up line in the aim direction.
+  for (let i = 1; i <= 15; i += 2) {
+    const d = i * 6;
+    ctx.fillStyle = "rgba(255,230,107,0.55)";
+    ctx.fillRect(Math.round(p.x + ux * d), Math.round(p.y + uy * d), 1, 1);
+  }
+  // Ring the man who'd be selected — the one under the cursor if you're on one,
+  // else the man the flick points at.
+  const target = switchPick(p);
+  if (target) {
+    ctx.strokeStyle = "rgba(255,230,107,0.9)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.ellipse(target.x, target.y + 3, PLAYER_R + 2, (PLAYER_R + 2) * 0.5, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+}
+
 function drawBall() {
-  // Magnet attraction visuals: receiver ring pulse + ball trail.
-  if (ball.passReceiver && ball.magnet > 0 && !ball.owner) {
+  // Magnet attraction visuals: receiver ring pulse + ball trail. This is a
+  // human player-assist cue, so it's hidden in AUTOPLAY (AI vs AI) — there's no
+  // one to aim the pass and the gold ring just clutters the watch-only view.
+  if (!autoPlay && ball.passReceiver && ball.magnet > 0 && !ball.owner) {
     const rd = dist(ball, ball.passReceiver);
     if (rd <= ball.magnet) {
       // Receiver: pulsing ring that tightens as the ball gets close.
@@ -2413,9 +2612,18 @@ function drawHud() {
   const BAR_H = 27;
 
   // ----- Left: score (top-left corner only, no full-width bar) -----
-  const lt = teamData(leftKey);
-  const rt = teamData(rightKey);
-  const scoreStr = `${scoreL}-${scoreR}`;
+  // On a road game the host is the home team, so the scoreboard reads host-first:
+  // the opponent (right) takes the left slot and YOUR team shows on the right.
+  const flip = roadAway();
+  const homeSlotKey = flip ? rightKey : leftKey;
+  const awaySlotKey = flip ? leftKey : rightKey;
+  const homeSlotKit = flip ? rightKitType : leftKitType;
+  const awaySlotKit = flip ? leftKitType : rightKitType;
+  const homeSlotScore = flip ? scoreR : scoreL;
+  const awaySlotScore = flip ? scoreL : scoreR;
+  const lt = teamData(homeSlotKey);
+  const rt = teamData(awaySlotKey);
+  const scoreStr = `${homeSlotScore}-${awaySlotScore}`;
   let clockStr, clockColor;
   if (clock >= MATCH_SECONDS && stoppageTime > 0) {
     const extra = Math.max(1, Math.ceil((clock - MATCH_SECONDS) * MATCH_MINUTES / MATCH_SECONDS));
@@ -2436,14 +2644,55 @@ function drawHud() {
   const blockW = lx + kitW + 3 + lW + GAP + sW + GAP + rW + 3 + kitW + 8;
   ctx.fillStyle = "#040a14";
   ctx.fillRect(0, 0, blockW, BAR_H);
-  drawKit(ctx, leftKey, lx + 5, ly + 4, KS, leftKitType);
+  drawKit(ctx, homeSlotKey, lx + 5, ly + 4, KS, homeSlotKit);
   drawText(ctx, lt.abbr, lx + kitW + 3, ly, SC, "#ffffff");
   drawText(ctx, scoreStr, lx + kitW + 3 + lW + GAP, ly, SC, "#ffe66b");
   drawText(ctx, rt.abbr, lx + kitW + 3 + lW + GAP + sW + GAP, ly, SC, "#ffffff");
-  drawKit(ctx, rightKey, lx + kitW + 3 + lW + GAP + sW + GAP + rW + 3 + 5, ly + 4, KS, rightKitType);
+  drawKit(ctx, awaySlotKey, lx + kitW + 3 + lW + GAP + sW + GAP + rW + 3 + 5, ly + 4, KS, awaySlotKit);
   const clkW = textWidth(clockStr, 1);
   const clkX = lx + kitW + 3 + lW + GAP + Math.floor((sW - clkW) / 2);
   drawText(ctx, clockStr, clkX, ly + 13, 1, clockColor);
+
+  // Confederation badge, same height as the score block, immediately to its
+  // right — only during a Road-to-the-World-Cup qualifier (AFC, CAF, ...).
+  if (afcQualifier) drawConfedBadgeHud(blockW, 0, BAR_H, roadConfed || "AFC");
+}
+
+// An original geometric globe-and-wordmark confederation emblem, drawn in the
+// game's pixel style (not a copy of any official artwork). Square `size`, a
+// confederation-tinted field, white globe grid + the confederation wordmark.
+const CONFED_FIELD = { AFC: "#0c2340", CAF: "#0f5132", CONMEBOL: "#10366e", UEFA: "#1a2350", CONCACAF: "#5a1320", OFC: "#0c4a52" };
+const CONFED_ABBR_HUD = { AFC: "AFC", CAF: "CAF", CONMEBOL: "CMB", UEFA: "UEFA", CONCACAF: "CCF", OFC: "OFC" };
+function drawConfedBadgeHud(x, y, size, confed) {
+  const w = "#ffffff";
+  ctx.fillStyle = CONFED_FIELD[confed] || "#0c2340";
+  ctx.fillRect(x, y, size, size);
+  ctx.fillStyle = "#1f3a66"; // 1px divider from the scoreboard
+  ctx.fillRect(x, y, 1, size);
+
+  const cx = Math.round(x + size / 2);
+  const gy = Math.round(y + size * 0.37); // globe centre, upper portion
+  const r = Math.round(size * 0.29); // globe radius
+  const m = Math.round(r * 0.5);
+  const pen = makePen(ctx, cx, gy, 1);
+
+  // Longitude/latitude grid, clipped to the globe disc.
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, gy, r, 0, Math.PI * 2);
+  ctx.clip();
+  pen.line(0, -r, 0, r, 1, w); // central meridian
+  pen.line(-m, -r, -m, r, 1, w);
+  pen.line(m, -r, m, r, 1, w);
+  pen.line(-r, 0, r, 0, 1, w); // equator
+  pen.line(-r, -m, r, -m, 1, w);
+  pen.line(-r, m, r, m, 1, w);
+  ctx.restore();
+  pen.ring(0, 0, r, 1, w); // globe outline
+
+  const label = CONFED_ABBR_HUD[confed] || confed.slice(0, 4);
+  const tw = textWidth(label, 1);
+  drawText(ctx, label, Math.round(cx - tw / 2), y + size - 6, 1, w);
 }
 
 // ---------------------------------------------------------------------------
@@ -2462,6 +2711,26 @@ PIB.y = PIB.margin + 4;
 
 function pibRect(i) {
   return { x: PIB.x + i * (PIB.btnW + PIB.gap), y: PIB.y };
+}
+
+// Master-volume steps the speaker button cycles through (mute → full). A click
+// steps DOWN one notch and wraps from mute back to full, like tapping volume-down.
+const VOL_STEPS = [0, 0.25, 0.5, 0.75, 1];
+// True when the cursor is over the speaker (volume) button — index 3 of the bar.
+function pibOverVolume(cx, cy) {
+  if (pibCollapsed) return false;
+  const r = pibRect(3);
+  return cx >= r.x && cx < r.x + PIB.btnW && cy >= r.y && cy < r.y + PIB.btnH;
+}
+function cycleMasterVolume() {
+  // Snap the current level to the nearest step, then drop one (wrapping at mute).
+  let idx = 0, best = Infinity;
+  for (let i = 0; i < VOL_STEPS.length; i++) {
+    const d = Math.abs(VOL_STEPS[i] - Sfx.masterVol);
+    if (d < best) { best = d; idx = i; }
+  }
+  const next = (idx - 1 + VOL_STEPS.length) % VOL_STEPS.length;
+  Sfx.setMasterVol(VOL_STEPS[next]);
 }
 
 function pibBtn(bx, by, active, hover) {
@@ -2492,7 +2761,7 @@ function pibHandleClick(cx, cy) {
       if (i === 0) togglePause();
       else if (i === 1) controlsOpen = !controlsOpen;
       else if (i === 2) { paused = false; autoPlay = false; state = STATE.TITLE; }
-      else if (i === 3) Sfx.setCrowdOff(!Sfx.crowdOff);
+      else if (i === 3) cycleMasterVolume();
       else if (i === 4) Sfx.setSfxOff(!Sfx.sfxOff);
       return true;
     }
@@ -2517,7 +2786,7 @@ function drawPauseIconBar() {
     const r = pibRect(i);
     const bx = r.x;
     const hover = mouseActive && mouseX >= bx && mouseX < bx + PIB.btnW && mouseY >= by && mouseY < by + PIB.btnH;
-    const active = (i === 0 && paused) || (i === 1 && controlsOpen) || (i === 3 && Sfx.crowdOff) || (i === 4 && Sfx.sfxOff);
+    const active = (i === 0 && paused) || (i === 1 && controlsOpen) || (i === 3 && Sfx.masterVol === 0) || (i === 4 && Sfx.sfxOff);
     pibBtn(bx, by, active, hover);
     const ic = active ? "#000000" : "#ffffff";
     // Center 14px icons in 20px button: 3px inset
@@ -2562,19 +2831,28 @@ function pibDrawRestart(bx, by, col) {
 
 function pibDrawVolume(bx, by, col) {
   ctx.fillStyle = col;
+  // Speaker glyph (left half of the icon).
   ctx.fillRect(bx + 1, by + 5, 3, 4);  // speaker body
   ctx.fillRect(bx + 4, by + 5, 1, 4);
   ctx.fillRect(bx + 5, by + 4, 1, 6);
   ctx.fillRect(bx + 6, by + 3, 1, 8);
-  if (Sfx.crowdOff) {
-    ctx.fillStyle = col;
+  // Level read-out (right half): a 4-bar meter that grows with master volume; a
+  // muted level (0) shows the classic X instead.
+  const lvl = Math.round(Sfx.masterVol * (VOL_STEPS.length - 1)); // 0..4 filled bars
+  if (lvl <= 0) {
     for (let k = 0; k < 4; k++) {
-      ctx.fillRect(bx + 8 + k, by + 3 + k, 1, 1);
-      ctx.fillRect(bx + 11 - k, by + 3 + k, 1, 1);
+      ctx.fillRect(bx + 8 + k, by + 4 + k, 1, 1);
+      ctx.fillRect(bx + 11 - k, by + 4 + k, 1, 1);
     }
-  } else {
-    ctx.fillRect(bx + 8, by + 5, 1, 4);
-    ctx.fillRect(bx + 10, by + 3, 1, 8);
+    return;
+  }
+  // Four ascending bars; filled ones are bright, empty ones a dim outline.
+  for (let b = 0; b < 4; b++) {
+    const h = 2 + b * 2;            // 2,4,6,8 px tall
+    const x = bx + 8 + b * 2;
+    const y = by + 11 - h;
+    ctx.fillStyle = b < lvl ? col : "rgba(255,255,255,0.28)";
+    ctx.fillRect(x, y, 1, h);
   }
 }
 
@@ -2618,7 +2896,7 @@ function drawControlsPanel() {
     ["MOVE", "WASD / ARROWS"],
     ["AIM", "MOUSE"],
     ["KICK / TACKLE", "HOLD LMB"],
-    ["SWITCH", "E"],
+    ["SWITCH MAN", "CLICK / E"],
     ["SPRINT", "SHIFT"],
     ["PAUSE", "P / ESC"],
     ["SUBS", "B"],
@@ -2671,6 +2949,9 @@ function drawOverlays() {
     ctx.lineWidth = 2;
     ctx.strokeRect(pbx + 1, pby + 1, pbw - 2, pbh - 2);
     drawTextCentered(ctx, "PLAY", VIEW_W / 2, pby + Math.round((pbh - 15) / 2), 3, pbHover ? "#ffffff" : "#9fe6b0");
+    // Dev-mode wrench (bottom-right). Subtle — a faint affordance, not a feature.
+    const wbHover = mouseActive && mouseX >= DEV_BTN.x && mouseX <= DEV_BTN.x + DEV_BTN.w && mouseY >= DEV_BTN.y && mouseY <= DEV_BTN.y + DEV_BTN.h;
+    drawWrench(ctx, DEV_BTN.x + DEV_BTN.w / 2, DEV_BTN.y + DEV_BTN.h / 2, 14, wbHover ? "#ffe66b" : "#5d6b7a");
     return;
   }
   if (state === STATE.TEAM_SELECT) {
@@ -2684,7 +2965,7 @@ function drawOverlays() {
   if (state === STATE.HALFTIME) {
     dim(0.65);
     drawTextCentered(ctx, "HALF TIME", VIEW_W / 2, 96, 6, "#ffffff");
-    drawTextCentered(ctx, `${scoreL} - ${scoreR}`, VIEW_W / 2, 148, 6, "#ffe66b");
+    drawTextCentered(ctx, roadAway() ? `${scoreR} - ${scoreL}` : `${scoreL} - ${scoreR}`, VIEW_W / 2, 148, 6, "#ffe66b");
     blink(() => drawTextCentered(ctx, "PRESS ENTER TO CONTINUE", VIEW_W / 2, 204, 2, "#9fe6b0"));
     return;
   }
@@ -2710,7 +2991,7 @@ function drawOverlays() {
   if (state === STATE.FULLTIME) {
     dim(0.6);
     drawTextCentered(ctx, "FULL TIME", VIEW_W / 2, 96, 6, "#ffffff");
-    drawTextCentered(ctx, `${scoreL} - ${scoreR}`, VIEW_W / 2, 144, 6, "#ffe66b");
+    drawTextCentered(ctx, roadAway() ? `${scoreR} - ${scoreL}` : `${scoreL} - ${scoreR}`, VIEW_W / 2, 144, 6, "#ffe66b");
     if (autoPlay) {
       const cx = VIEW_W / 2;
       const ky = 168;
@@ -2721,8 +3002,8 @@ function drawOverlays() {
     }
     drawTextCentered(ctx, winnerText, VIEW_W / 2, 196, 2, "#9fe6b0");
     if (autoPlay) {
-      const secs = Math.ceil(Math.max(stateTimer, 0));
-      blink(() => drawTextCentered(ctx, `NEXT MATCH IN ${secs}...  ENTER SKIP  ESC MENU`, VIEW_W / 2, 232, 1, "#9fe6b0"));
+      blink(() => drawTextCentered(ctx, "ENTER  PICK 2 NEW TEAMS", VIEW_W / 2, 226, 2, "#9fe6b0"));
+      drawTextCentered(ctx, "R  REMATCH SAME TEAMS      ESC  MENU", VIEW_W / 2, 246, 1, "#bcd3ff");
     } else if (inTournament) {
       blink(() => drawTextCentered(ctx, "ENTER  BACK TO WORLD CUP", VIEW_W / 2, 226, 2, "#9fe6b0"));
     } else if (FEATURE.teamSelect) {
@@ -2743,24 +3024,29 @@ function drawOverlays() {
     const stealMode = ball.owner && ball.owner !== controlled &&
       ball.owner.teamKey !== controlled.teamKey &&
       len(ball.owner.x - controlled.x, ball.owner.y - controlled.y) < STEAL_PROMPT_RANGE;
-    ctx.fillStyle = "rgba(0,0,0,0.5)";
-    ctx.fillRect(bx - 1, by - 1, barW + 2, 4);
-    if (stealMode) {
-      // Defend mode: dark base bar + gold target zone + white cursor
-      ctx.fillStyle = "#2a3a5a";
-      ctx.fillRect(bx, by, barW, 2);
-      const hw = stealGoldHalfWidth(controlled, ball.owner);
-      const golL = Math.round(barW * clamp(STEAL_GOLD_CENTER - hw, 0, 1));
-      const golR = Math.round(barW * clamp(STEAL_GOLD_CENTER + hw, 0, 1));
-      ctx.fillStyle = "#ffd23b";
-      ctx.fillRect(bx + golL, by, Math.max(1, golR - golL), 2);
-      const cx = clamp(Math.round(barW * t), 0, barW - 1);
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(bx + cx, by, 1, 2);
-    } else {
-      // Attack mode: color-coded power fill
-      ctx.fillStyle = t < 0.6 ? "#7bff8a" : t < 0.85 ? "#ffe66b" : "#ff6b6b";
-      ctx.fillRect(bx, by, Math.round(barW * t), 2);
+    // A switch-flick (off the ball, not next to a carrier) shows an aim line
+    // instead of a power bar — see drawDefenseAim — so skip the meter here.
+    const switchMode = ball.owner !== controlled && !stealMode;
+    if (!switchMode) {
+      ctx.fillStyle = "rgba(0,0,0,0.5)";
+      ctx.fillRect(bx - 1, by - 1, barW + 2, 4);
+      if (stealMode) {
+        // Defend mode: dark base bar + gold target zone + white cursor
+        ctx.fillStyle = "#2a3a5a";
+        ctx.fillRect(bx, by, barW, 2);
+        const hw = stealGoldHalfWidth(controlled, ball.owner);
+        const golL = Math.round(barW * clamp(STEAL_GOLD_CENTER - hw, 0, 1));
+        const golR = Math.round(barW * clamp(STEAL_GOLD_CENTER + hw, 0, 1));
+        ctx.fillStyle = "#ffd23b";
+        ctx.fillRect(bx + golL, by, Math.max(1, golR - golL), 2);
+        const cx = clamp(Math.round(barW * t), 0, barW - 1);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(bx + cx, by, 1, 2);
+      } else {
+        // Attack mode: color-coded power fill
+        ctx.fillStyle = t < 0.6 ? "#7bff8a" : t < 0.85 ? "#ffe66b" : "#ff6b6b";
+        ctx.fillRect(bx, by, Math.round(barW * t), 2);
+      }
     }
   }
 
@@ -2770,6 +3056,15 @@ function drawOverlays() {
     const fy = unluckyFlash.y - 10 - progress * 18;
     ctx.globalAlpha = alpha;
     drawTextCentered(ctx, "CLOSE!", unluckyFlash.x, fy, 2, "#ff8c42");
+    ctx.globalAlpha = 1;
+  }
+
+  if (stealFlash.t > 0 && state === STATE.PLAYING && !paused) {
+    const progress = 1 - stealFlash.t / STEAL_FLASH_DURATION;
+    const alpha = clamp(stealFlash.t / 0.28, 0, 1);
+    const fy = stealFlash.y - 10 - progress * 18;
+    ctx.globalAlpha = alpha;
+    drawTextCentered(ctx, "STEAL!", stealFlash.x, fy, 2, "#7cff8a");
     ctx.globalAlpha = 1;
   }
 
@@ -2820,7 +3115,8 @@ function eligibleBench(bench, line) {
   return bench.filter((b) => b.line === line);
 }
 
-function enterTeamSelect() {
+function enterTeamSelect(forAuto = false) {
+  selectForAuto = forAuto;
   selStage = "home";
   gridCursor = Math.max(0, NATION_KEYS.indexOf("BRA"));
   pickedHome = null;
@@ -2906,28 +3202,28 @@ function updateTeamSelect() {
       // Clicking a kit that's already selected, or the PLAY button, starts the match.
       if (clickY > KIT_Y - KS * 4 - 10 && clickY < KIT_Y + KS * 7) {
         if (Math.abs(clickX - HOME_X) < KS * 6) {
-          if (leftKitType === "home") { setupMatch(pickedHome, pickedAway, true, leftKitType, rightKitType); return; }
+          if (leftKitType === "home") { launchSelectedMatch(); return; }
           leftKitType = "home";
         } else if (Math.abs(clickX - AWAY_X) < KS * 6) {
-          if (leftKitType === "away") { setupMatch(pickedHome, pickedAway, true, leftKitType, rightKitType); return; }
+          if (leftKitType === "away") { launchSelectedMatch(); return; }
           leftKitType = "away";
         } else if (Math.abs(clickX - OPP_HOME_X) < KS * 6) {
-          if (rightKitType === "home") { setupMatch(pickedHome, pickedAway, true, leftKitType, rightKitType); return; }
+          if (rightKitType === "home") { launchSelectedMatch(); return; }
           rightKitType = "home";
         } else if (Math.abs(clickX - OPP_AWAY_X) < KS * 6) {
-          if (rightKitType === "away") { setupMatch(pickedHome, pickedAway, true, leftKitType, rightKitType); return; }
+          if (rightKitType === "away") { launchSelectedMatch(); return; }
           rightKitType = "away";
         }
       } else {
         const kpby = VIEW_H - 48;
         if (clickX >= VIEW_W / 2 - 90 && clickX <= VIEW_W / 2 + 90 && clickY >= kpby && clickY <= kpby + 28) {
-          setupMatch(pickedHome, pickedAway, true, leftKitType, rightKitType);
+          launchSelectedMatch();
           return;
         }
       }
     }
     if (keyPressed("start")) {
-      setupMatch(pickedHome, pickedAway, true, leftKitType, rightKitType);
+      launchSelectedMatch();
     }
     return;
   }
@@ -3048,7 +3344,7 @@ function drawKitSelect() {
 
   // --- Your team (left half) ---
   const lTeam = teamData(pickedHome);
-  drawTextCentered(ctx, "YOUR TEAM", 160, 78, 1, "#9fe6b0");
+  drawTextCentered(ctx, selectForAuto ? "TEAM 1" : "YOUR TEAM", 160, 78, 1, "#9fe6b0");
   drawTextCentered(ctx, lTeam.name, 160, 94, 2, "#ffffff");
 
   // Home kit option
@@ -3069,7 +3365,7 @@ function drawKitSelect() {
 
   // --- Opponent (right half, manual) ---
   const rTeam = teamData(pickedAway);
-  drawTextCentered(ctx, "OPPONENT", 480, 78, 1, "#f0a070");
+  drawTextCentered(ctx, selectForAuto ? "TEAM 2" : "OPPONENT", 480, 78, 1, "#f0a070");
   drawTextCentered(ctx, rTeam.name, 480, 94, 2, "#ffffff");
 
   // Opponent home kit option
@@ -3104,14 +3400,16 @@ function drawTeamSelect() {
   drawTextCentered(ctx, "WORLD CUP JAM", VIEW_W / 2, 14, 3, "#ffe66b");
   drawTextCentered(
     ctx,
-    selStage === "home" ? "SELECT YOUR TEAM" : "SELECT OPPONENT",
+    selStage === "home"
+      ? (selectForAuto ? "SELECT TEAM 1" : "SELECT YOUR TEAM")
+      : (selectForAuto ? "SELECT TEAM 2" : "SELECT OPPONENT"),
     VIEW_W / 2,
     46,
     2,
     "#ffffff"
   );
   if (selStage === "away" && pickedHome) {
-    drawTextCentered(ctx, "YOU  " + teamData(pickedHome).name, VIEW_W / 2, 66, 1, "#9fe6b0");
+    drawTextCentered(ctx, (selectForAuto ? "TEAM 1  " : "YOU  ") + teamData(pickedHome).name, VIEW_W / 2, 66, 1, "#9fe6b0");
   }
 
   // Search bar
@@ -3163,7 +3461,7 @@ function drawTeamSelect() {
     t.drawFlag(ctx, key, r.x + 12, r.y + 10, 40, 26);
     drawKit(ctx, key, r.x + r.w - 26, r.y + 23, 1.5);
     drawTextCentered(ctx, t.name, r.x + r.w / 2, r.y + 44, 1, isYou ? "#7cff8a" : sel ? "#ffe66b" : "#eaf0ff");
-    if (isYou) drawTextCentered(ctx, "YOUR TEAM", r.x + r.w / 2, r.y + 56, 1, "#7cff8a");
+    if (isYou) drawTextCentered(ctx, selectForAuto ? "TEAM 1" : "YOUR TEAM", r.x + r.w / 2, r.y + 56, 1, "#7cff8a");
     else drawTextCentered(ctx, "OVR " + teamOvr(key), r.x + r.w / 2, r.y + 56, 1, ovrColor(teamOvr(key)));
   }
 
@@ -3185,7 +3483,9 @@ function drawTeamSelect() {
   blink(() =>
     drawTextCentered(
       ctx,
-      selStage === "home" ? "ARROWS MOVE      ENTER / CLICK CHOOSE" : "ENTER / CLICK OPPONENT      ESC BACK",
+      selStage === "home"
+        ? "ARROWS MOVE      ENTER / CLICK CHOOSE"
+        : (selectForAuto ? "ENTER / CLICK TEAM 2      ESC BACK" : "ENTER / CLICK OPPONENT      ESC BACK"),
       VIEW_W / 2,
       VIEW_H - 12,
       1,
@@ -3569,6 +3869,9 @@ window.__wcj = {
   get tension() {
     return Math.round(audioTension() * 100) / 100;
   },
+  get audio() {
+    return Sfx.crowdState;
+  },
   get score() {
     return [scoreL, scoreR];
   },
@@ -3599,6 +3902,11 @@ window.__wcj = {
   },
   start() {
     setupMatch(); // force a clean match (used by tests)
+  },
+  // Pin the stadium type for the next setupMatch (3 = dev-only Asian Qualifier);
+  // pass null to restore the normal rotation. Used by dev mode + tests.
+  forceStadium(t) {
+    forcedStadiumType = t == null ? null : t | 0;
   },
   skipKickoff() {
     if (state === STATE.KICKOFF) {
@@ -3660,8 +3968,12 @@ window.__wcj = {
     FEATURE.teamSelect = !!v;
     return FEATURE.teamSelect;
   },
-  enterSelect() {
-    enterTeamSelect();
+  enterSelect(forAuto = false) {
+    autoPlay = false;
+    enterTeamSelect(forAuto);
+  },
+  get autoPlay() {
+    return autoPlay;
   },
   get teams() {
     return {
@@ -3688,6 +4000,9 @@ window.__wcj = {
   },
   get crowdOff() { return Sfx.crowdOff; },
   setCrowdOff(v) { Sfx.setCrowdOff(v); },
+  get masterVol() { return Sfx.masterVol; },
+  setMasterVol(v) { Sfx.setMasterVol(v); },
+  cycleVolume() { cycleMasterVolume(); return Sfx.masterVol; },
   // --- World Cup tournament mode (verification) ---
   get wc() {
     return WC;
@@ -3708,4 +4023,25 @@ window.__wcj = {
   get inTournament() {
     return inTournament;
   },
+  // --- Road to the World Cup (verification) ---
+  roadStart(key = "JPN", confed) {
+    const s = WC.devStartRoad(key, confed);
+    state = STATE.WC;
+    return s;
+  },
+  roadAdvance() {
+    return WC.devRoadAdvance();
+  },
+  roadPlay() {
+    WC.devRoadPlay();
+    return state;
+  },
+  get roadState() {
+    return WC.roadSnapshot();
+  },
+  // --- Save files (verification) ---
+  saveSlot(i = 0) { return WC.devSaveSlot(i); },
+  loadSlot(i = 0) { state = STATE.WC; return WC.devLoadSlot(i); },
+  listSlots() { return WC.devListSlots(); },
+  deleteSlot(i = 0) { return WC.devDeleteSlot(i); },
 };

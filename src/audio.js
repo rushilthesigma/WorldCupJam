@@ -5,16 +5,32 @@ let ctx = null;
 let master = null;
 let crowdGain = null;
 let crowdBase = 0.18; // resting murmur level
+let crowdBoost = 1; // stadium loudness multiplier (>1 = raucous ground, e.g. AFC qualifying)
 const buffers = {}; // name -> AudioBuffer
 let loading = false;
 let crowdStarted = false;
 let crowdMuted = false; // silenced while the game is paused
-let crowdOff = localStorage.getItem("wcj-crowd-off") !== "0"; // user setting; default off
+let crowdOff = localStorage.getItem("wcj-crowd-off") === "1"; // user setting; default ON (only an explicit mute silences it)
 let sfxOff = localStorage.getItem("wcj-sfx-off") === "1"; // mute ball/goal/whistle sounds
 let lastOoh = -10;
 
+// Master volume 0..1 — overall loudness of the whole bus (crowd + sfx). Persisted;
+// defaults to full. The master gain node sits at MASTER_BASE * masterVol so a full
+// setting keeps the old headroom (0.9) and 0 is a hard mute.
+const MASTER_BASE = 0.9;
+let masterVol = (() => {
+  const v = parseFloat(localStorage.getItem("wcj-master-vol"));
+  return isNaN(v) ? 1 : clamp01(v);
+})();
+
 function crowdSilent() {
   return crowdMuted || crowdOff;
+}
+
+// Resting (no-tension) crowd level, scaled by the loudness boost and capped to
+// stay just under unity so a boosted ground doesn't hard-clip the master bus.
+function restingGain() {
+  return crowdSilent() ? 0 : Math.min(0.97, crowdBase * crowdBoost);
 }
 
 function ac() {
@@ -22,7 +38,7 @@ function ac() {
     try {
       ctx = new (window.AudioContext || window.webkitAudioContext)();
       master = ctx.createGain();
-      master.gain.value = 0.9;
+      master.gain.value = MASTER_BASE * masterVol;
       master.connect(ctx.destination);
     } catch {
       ctx = null;
@@ -40,7 +56,10 @@ async function loadAll() {
   await Promise.all(
     names.map(async (n) => {
       try {
-        const res = await fetch(`/sfx/${n}.wav`);
+        // Base-aware: under GitHub Pages the app is served from /WorldCupJam/,
+        // so /sfx/* (root-absolute) 404s. import.meta.env.BASE_URL is "/" in dev
+        // without a base and "/WorldCupJam/" in the deploy — both end in a slash.
+        const res = await fetch(`${import.meta.env.BASE_URL}sfx/${n}.wav`);
         const arr = await res.arrayBuffer();
         buffers[n] = await a.decodeAudioData(arr);
       } catch {
@@ -59,7 +78,7 @@ function startCrowd() {
   src.buffer = buffers["crowd-loop"];
   src.loop = true;
   crowdGain = a.createGain();
-  crowdGain.gain.value = crowdSilent() ? 0 : crowdBase;
+  crowdGain.gain.value = restingGain();
   src.connect(crowdGain).connect(master);
   src.start();
 }
@@ -107,23 +126,42 @@ export const Sfx = {
   // Crowd tension, 0..1 — louder as the ball nears a goal / a chance builds.
   setIntensity(level) {
     if (!crowdGain || !ctx || crowdSilent()) return;
-    const target = crowdBase + clamp01(level) * 0.55;
+    const target = Math.min(0.97, (crowdBase + clamp01(level) * 0.55) * crowdBoost);
     crowdGain.gain.setTargetAtTime(target, ctx.currentTime, 0.25);
   },
   // Mute/unmute the ambient crowd loop — used to fall silent while paused.
   setCrowdMuted(muted) {
     crowdMuted = muted;
     if (!crowdGain || !ctx) return;
-    crowdGain.gain.setTargetAtTime(crowdSilent() ? 0 : crowdBase, ctx.currentTime, 0.15);
+    crowdGain.gain.setTargetAtTime(restingGain(), ctx.currentTime, 0.15);
   },
   setCrowdOff(off) {
     crowdOff = off;
     localStorage.setItem("wcj-crowd-off", off ? "1" : "0");
     if (!crowdGain || !ctx) return;
-    crowdGain.gain.setTargetAtTime(crowdSilent() ? 0 : crowdBase, ctx.currentTime, 0.15);
+    crowdGain.gain.setTargetAtTime(restingGain(), ctx.currentTime, 0.15);
   },
   get crowdOff() {
     return crowdOff;
+  },
+  // Live crowd-audio introspection (used by the __wcj test hook).
+  get crowdState() {
+    return {
+      off: crowdOff,
+      muted: crowdMuted,
+      silent: crowdSilent(),
+      started: crowdStarted,
+      loaded: !!buffers["crowd-loop"],
+      ctxState: ctx ? ctx.state : null,
+      gain: crowdGain ? +crowdGain.gain.value.toFixed(3) : null,
+    };
+  },
+  // Scale the whole stadium — resting murmur, tension swell, and goal roar.
+  // boost = 1 is the normal level; AFC qualifying drives a louder ground.
+  setCrowdBoost(boost) {
+    crowdBoost = Math.max(1, boost || 1);
+    if (!crowdGain || !ctx) return;
+    crowdGain.gain.setTargetAtTime(restingGain(), ctx.currentTime, 0.2);
   },
   // Anticipation "ooh" for a chance/near-miss (rate-limited).
   ooh() {
@@ -132,21 +170,32 @@ export const Sfx = {
     lastOoh = ctx.currentTime;
     playBuffer("ooh", 0.9);
   },
-  // Goal roar.
-  goal() {
+  // A scored goal. The stadium roar (cheer sample) only fires when the HOME side
+  // scores; an away goal still gets the little fanfare blip but no crowd cheer.
+  goal(homeCheer = true) {
     if (sfxOff) return;
-    playBuffer("cheer", 1);
+    if (homeCheer) playBuffer("cheer", Math.min(1.6, crowdBoost));
     tone(440, 0.12, "square", 0.14);
     setTimeout(() => tone(660, 0.12, "square", 0.14), 110);
     setTimeout(() => tone(880, 0.22, "square", 0.14), 220);
   },
-  cheer() { if (!sfxOff) playBuffer("cheer", 1); },
+  cheer() { if (!sfxOff) playBuffer("cheer", Math.min(1.6, crowdBoost)); },
   setSfxOff(off) {
     sfxOff = off;
     localStorage.setItem("wcj-sfx-off", off ? "1" : "0");
   },
   get sfxOff() {
     return sfxOff;
+  },
+  // Master volume (0..1) — scales the whole bus. Ramped briefly so a step doesn't
+  // click. Persisted so the level survives reloads.
+  setMasterVol(v) {
+    masterVol = clamp01(v);
+    localStorage.setItem("wcj-master-vol", String(masterVol));
+    if (master && ctx) master.gain.setTargetAtTime(MASTER_BASE * masterVol, ctx.currentTime, 0.04);
+  },
+  get masterVol() {
+    return masterVol;
   },
 
   resume() {
