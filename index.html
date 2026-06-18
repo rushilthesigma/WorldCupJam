@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Retro pixel-art football game featuring the 2026 FIFA World Cup. Pick your nation and compete for the trophy." />
+    <meta property="og:title" content="World Cup Jam" />
+    <meta property="og:description" content="Retro pixel-art football game — 2026 FIFA World Cup edition." />
+    <title>World Cup Jam</title>
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #05080f;
+        overflow: hidden;
+      }
+      #stage {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #game {
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+        display: block;
+      }
+    </style>
+    <script type="module" crossorigin src="/WorldCupJam/assets/index-DdkDjaU6.js"></script>
+  </head>
+  <body>
+    <div id="stage">
+      <canvas id="game"></canvas>
+    </div>
+  </body>
+</html>
