@@ -68,7 +68,7 @@ export const PASS_GUARD_TIME = 1.6;
 // the ball to their feet within this radius, which grows with team OVR (a sharper
 // side controls passes from further out). Classic mode uses the floor.
 export const PASS_MAGNET_MIN = 16;
-export const PASS_MAGNET_MAX = 34;
+export const PASS_MAGNET_MAX = 42; // elite end trimmed (was 48) so a top side's passing edge is smaller; floor unchanged
 
 // Stealing — a deliberate, committed lunge (the defender presses F), not the old
 // passive auto-steal. Positioning + timing win the ball; whiff it and you're

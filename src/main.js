@@ -94,9 +94,8 @@ resize();
 
 // ---------------------------------------------------------------------------
 // Input — move with WASD / arrows, aim + kick with the mouse, and when
-// defending, click the teammate you want to control (or flick the aim toward him;
-// E grabs the man nearest the ball as a fallback), or hold LMB next to a carrier
-// to time a steal. Shift sprints.
+// defending, press E to switch to the man nearest the ball, or hold LMB next to
+// a carrier to time a steal. Shift sprints.
 // ---------------------------------------------------------------------------
 const keys = new Set();
 const pressed = new Set(); // edge-triggered, cleared each rendered frame
@@ -154,7 +153,7 @@ canvas.addEventListener("mousedown", (e) => {
   if (e.button === 0) {
     mouseShoot = true;
     toView(e);
-    if (pibHandleClick(mouseX, mouseY)) {
+    if (pibHandleClick(mouseX, mouseY) || tbHandleClick(mouseX, mouseY)) {
       Sfx.resume();
       return;
     }
@@ -284,26 +283,32 @@ const NEUTRAL_ATTR = {
 };
 
 // Turn a 1-99 OVR into the handful of multipliers the simulation reads. Ranges
-// are tuned so the OVR gap is clearly felt: a top side is noticeably sharper
-// (quicker, harder to rob, keeper reacts faster) and a weak side noticeably
-// blunter — without tipping into "unplayable" at the bottom of the band.
+// are tuned so the OVR gap is still felt — a top side is sharper (quicker,
+// harder to rob, keeper reacts faster) — but the band is compressed so a weak
+// side stays playable: every floor (q=0) was lifted a notch, and each ceiling
+// (q=1) raised by half that, narrowing the gap so a lower-level team has a shot.
+// The non-speed ceilings (shoot/tackle/control + the keeper's tackle/reaction/
+// reach) were then pulled DOWN a touch so a top side's *skill* edge is smaller.
+// The floors (q=0) are untouched, so the gap closes by lowering the elite end —
+// not by buffing the minnows. Speed is deliberately left alone on both lines, so
+// pace stays the one attribute where a strong side is still clearly quicker.
 function attrsFromOvr(ovr, line) {
   const q = clamp((ovr - OVR_MIN) / (OVR_MAX - OVR_MIN), 0, 1);
   if (line === "GK") {
     return {
-      speed: lerp(0.92, 1.14, q),
+      speed: lerp(0.92, 1.30, q), // speed gap kept as-is
       shoot: 1,
-      tackle: lerp(0.8, 1.25, q),
+      tackle: lerp(0.72, 1.40, q),
       control: 1, // keepers claim with gkReach, not the outfield touch radius
-      gkReaction: lerp(GK_REACTION * 1.45, GK_REACTION * 0.62, q), // better = quicker
-      gkReach: lerp(GK_REACH * 0.85, GK_REACH * 1.22, q),
+      gkReaction: lerp(GK_REACTION * 1.60, GK_REACTION * 0.48, q), // better = quicker (lower); elite end softened
+      gkReach: lerp(GK_REACH * 0.81, GK_REACH * 1.34, q),
     };
   }
   return {
-    speed: lerp(0.88, 1.15, q),
-    shoot: lerp(0.84, 1.2, q),
-    tackle: lerp(0.72, 1.35, q),
-    control: lerp(0.88, 1.4, q), // better players take a pass cleanly from farther out
+    speed: lerp(0.86, 1.32, q), // speed gap kept as-is
+    shoot: lerp(0.78, 1.34, q),
+    tackle: lerp(0.58, 1.54, q),
+    control: lerp(0.78, 1.54, q), // better players take a pass cleanly from farther out
     gkReaction: GK_REACTION,
     gkReach: GK_REACH,
   };
@@ -311,14 +316,15 @@ function attrsFromOvr(ovr, line) {
 
 // How well a team protects the ball: the chance (0..1) that one of their passes
 // survives a challenge, or that a dribbler shrugs off a steal attempt. Anchored
-// on the neutral 78 OVR, with each point swinging retention by ~1.5% — so the
+// on the neutral 78 OVR, with each point swinging retention by ~2.7% — so the
 // gap between a weak and an elite side bites harder than a flat "OVR as a
 // percentage" would. Classic mode (no squad, ovr 0) falls back to a 50/50
 // baseline ("half the time"). Capped both ends so it's never a literal sure
-// thing — or a literal giveaway.
+// thing — or a literal giveaway; the top cap was lowered (and the per-point swing
+// eased) so a strong side keeps the ball a little less automatically.
 function ovrGuard(ovr) {
   if (!ovr) return 0.5;
-  return clamp(0.78 + (ovr - 78) * 0.015, 0.45, 0.96);
+  return clamp(0.78 + (ovr - 78) * 0.023, 0.36, 0.92);
 }
 
 // Radius (px) within which the intended receiver of YOUR pass auto-collects the
@@ -328,6 +334,27 @@ function passMagnet(ovr) {
   if (!ovr) return PASS_MAGNET_MIN;
   const q = clamp((ovr - OVR_MIN) / (OVR_MAX - OVR_MIN), 0, 1);
   return lerp(PASS_MAGNET_MIN, PASS_MAGNET_MAX, q);
+}
+
+// --- SECRET LUCK OVR -------------------------------------------------------
+// Every match, each side draws a hidden "luck" rating that swings their REAL
+// team OVR by anywhere from -10 to +10 points. It's re-rolled fresh game to
+// game and applies to every scenario (Quick Play, World Cup, Road) — the same
+// matchup can feel a class better or worse depending on the day. The draw is a
+// flat/uniform distribution: all 21 outcomes (-10..+10) are equally likely, so
+// a big swing is exactly as probable as no swing at all. It never shows on the
+// scoreboard or cards (those always read the real NATIONS rating) — you only
+// feel it in how sharp a team plays.
+const LUCK_SWING = 10; // max points of luck in either direction
+function rollLuck() {
+  // Equal-probability integer in [-LUCK_SWING, +LUCK_SWING].
+  return Math.floor(Math.random() * (LUCK_SWING * 2 + 1)) - LUCK_SWING;
+}
+// Apply a luck swing to a real OVR, kept inside a valid 1-99 rating. ovr 0
+// (classic mode, no real squad) is left untouched — there's no real rating to
+// nudge, and classic stays neutral.
+function applyLuck(ovr, luck) {
+  return ovr ? clamp(ovr + luck, 1, 99) : 0;
 }
 
 // Short position labels by formation line.
@@ -397,6 +424,8 @@ let subOpen = false; // substitutions board open (in-match; team-select flow onl
 let isSquadMatch = false; // true when this match was launched via team-select (OVR + subs)
 let inTournament = false; // true while playing a World Cup tournament match (returns to the hub at full time)
 let autoPlay = false; // true in AI-vs-AI autoplay mode
+let luckL = 0; // this match's secret luck swing for the left team (-10..+10)
+let luckR = 0; // this match's secret luck swing for the right team (-10..+10)
 
 // --- Team-select / squad menu state (only used when FEATURE.teamSelect) ---
 let selStage = "home"; // "home" → "away" → "kit" within TEAM_SELECT
@@ -444,6 +473,46 @@ const STEAL_FLASH_DURATION = 0.9;
 
 const isLeft = (p) => p && p.teamKey === leftKey;
 
+// --- Match tactic (your side only) ------------------------------------------
+// A bottom-left bar (keys 1 / 2 / 3) trades pace for tackling bite. The
+// multipliers ride on top of each player's OVR attributes, so OVR still counts.
+// The opponent — and AI-vs-AI autoplay — always play the neutral baseline.
+const TACTICS = [
+  { speed: 0.78, tackle: 1.62 }, // <<  defend: properly slow, but really bites
+  { speed: 1, tackle: 1 },       // -   balanced: the tuned baseline
+  { speed: 1.30, tackle: 0.5 },  // >>  attack: properly quick, but tackles go soft
+];
+// Each tactic also leans the team's resting shape a hair up or down the pitch —
+// a VERY slight formation nudge (px along the attacking axis), not a reshuffle:
+// defend sits a touch deeper, attack a touch higher. Only your side, only while
+// you hold the tactic.
+const TACTIC_SHIFT = [-13, 0, 15];
+const TACTIC_LABEL = ["DEFENSE MODE", "HYBRID", "ATTACK MODE"];
+const TACTIC_COLOR = ["#7fbfe6", "#cdd9f0", "#ff9b6b"];
+let tactic = 1; // index into TACTICS; resets to balanced each kickoff
+// You only get a handful of tactic switches per match — spend them wisely.
+const TACTIC_CHANGES_MAX = 5;
+let tacticChangesLeft = TACTIC_CHANGES_MAX;
+// Switch your side's tactic, spending one of the limited changes. Re-selecting
+// the mode you're already in is free; once you're out of changes it's a no-op.
+function setTactic(i) {
+  if (i === tactic) return;
+  if (tacticChangesLeft <= 0) return;
+  tactic = i;
+  tacticChangesLeft--;
+}
+// Live multipliers for a player: the chosen tactic for your side, neutral for
+// everyone else (and whenever no human is in control).
+function tacticMult(p) {
+  return !autoPlay && p && p.teamKey === leftKey ? TACTICS[tactic] : TACTICS[1];
+}
+// Resting-shape lean for the current tactic (px along this player's attacking
+// axis). Only your side leans; everyone else keeps neutral shape.
+function tacticShift(p) {
+  if (autoPlay || !p || p.teamKey !== leftKey) return 0;
+  return TACTIC_SHIFT[tactic] * p.dir;
+}
+
 // Start a match. With no arguments this is the classic neutral BRA-vs-ARG game
 // (also used for replays). The team-select flow calls it with the chosen keys,
 // edited starting elevens, and their benches.
@@ -459,8 +528,14 @@ function setupMatch(lk = leftKey, rk = rightKey, squadMatch = false, lKit = "hom
   // One team-wide OVR per side (0 = classic neutral); every player shares it.
   const lOvr = squadMatch ? teamOvr(lk) : 0;
   const rOvr = squadMatch ? teamOvr(rk) : 0;
-  left = makeTeam(lk, +1, lOvr);
-  right = makeTeam(rk, -1, rOvr);
+  // Secret luck: each side draws a fresh -10..+10 swing this game (uniform, all
+  // outcomes equally likely) that nudges how sharp they play. Classic mode
+  // (ovr 0) draws none. The bench keeps the REAL rating so nothing on screen
+  // leaks the swing — only the live players carry the lucky ability.
+  luckL = lOvr ? rollLuck() : 0;
+  luckR = rOvr ? rollLuck() : 0;
+  left = makeTeam(lk, +1, applyLuck(lOvr, luckL));
+  right = makeTeam(rk, -1, applyLuck(rOvr, luckR));
   players = [...left, ...right];
   benchL = squadMatch ? makeBench(lOvr) : [];
   benchR = squadMatch ? makeBench(rOvr) : [];
@@ -476,6 +551,8 @@ function setupMatch(lk = leftKey, rk = rightKey, squadMatch = false, lKit = "hom
   controlsOpen = false;
   pibCollapsed = false;
   subOpen = false;
+  tactic = 1; // every match kicks off balanced
+  tacticChangesLeft = TACTIC_CHANGES_MAX; // fresh allotment of switches
   // Road-to-the-World-Cup qualifying is a raucous home ground: pack the stands
   // louder and badge the scoreboard with the confederation. Reset to baseline.
   afcQualifier = !!roadHome;
@@ -763,6 +840,10 @@ function _update(dt) {
     squadPickBench = -1;
     return;
   }
+  // Tactic switch — 1 defend · 2 balanced · 3 attack (your side only).
+  if (pressed.has("1")) setTactic(0);
+  else if (pressed.has("2")) setTactic(1);
+  else if (pressed.has("3")) setTactic(2);
   clock += dt;
   if (setpieceTimer > 0) setpieceTimer -= dt;
   if (unluckyFlash.t > 0) unluckyFlash.t -= dt;
@@ -781,6 +862,7 @@ function _update(dt) {
   handleHumanInput(dt);
   updateAI(dt);
   applySpacing(); // tactics: hold team shape — push teammates off each other
+  applyAntiCamp(dt); // no statues, no parking in the box — keep everyone moving
   updateLunges(dt); // commit darts (overrides movement) + tick cooldowns
   integratePlayers(dt);
   separatePlayers();
@@ -932,8 +1014,7 @@ function updateControl() {
     passInFlight = false;
   }
   // Defending: NO auto-switch. You keep the man you've got and change men only by
-  // the kicking motion — wind up the meter and flick it toward the teammate you
-  // want (see handleHumanInput / switchTowardAim), or tap E for the nearest man.
+  // tapping E, which jumps control to the teammate nearest the ball.
 
   // Manual switch — always jump to the player nearest the ball, now.
   if (keyPressed("switch")) {
@@ -948,50 +1029,6 @@ function updateControl() {
 function switchPlayer() {
   const c = nearestField(left, ball.x, ball.y);
   if (c) controlled = c;
-}
-
-// The teammate a switch-flick aims at: the nearest man inside a cone around the
-// aim direction (ux,uy from p), falling back to the most-aligned man if the cone
-// is empty. Shared by the input handler and the aim preview so they agree.
-function switchTarget(p, ux, uy) {
-  let best = null, bestD = Infinity, bestAlign = -2, bestAny = null;
-  for (const t of left) {
-    if (t === p || t.role === "GK") continue;
-    const dx = t.x - p.x, dy = t.y - p.y;
-    const d = len(dx, dy) || 1;
-    const align = (dx / d) * ux + (dy / d) * uy; // -1..1, how "toward" the aim
-    if (align > bestAlign) { bestAlign = align; bestAny = t; }
-    if (align >= 0.5 && d < bestD) { bestD = d; best = t; } // within ~60° cone
-  }
-  return best || bestAny;
-}
-
-// The outfielder under the cursor, if any (forgiving radius — the sprites are
-// only ~6px wide, so allow a comfortable click target).
-function manUnderCursor(p) {
-  let best = null, bestD = 14;
-  for (const t of left) {
-    if (t === p || t.role === "GK") continue;
-    const d = len(t.x - mouseX, t.y - mouseY);
-    if (d < bestD) { bestD = d; best = t; }
-  }
-  return best;
-}
-
-// Who a switch-release hands control to: the man you clicked ON if the cursor is
-// over one, otherwise the man the kick was flicked TOWARD. Shared by the input
-// handler and the aim preview so the ring always shows who you'll actually get.
-function switchPick(p) {
-  const onMan = manUnderCursor(p);
-  if (onMan) return onMan;
-  const a = aimVec(p);
-  const l = len(a.x, a.y) || 1;
-  return switchTarget(p, a.x / l, a.y / l);
-}
-
-function switchTowardAim(p) {
-  const pick = switchPick(p);
-  if (pick) controlled = pick;
 }
 
 // Flip every player to the opposite end — called once at half time.
@@ -1044,8 +1081,9 @@ function handleHumanInput(dt) {
     const l = len(mx, my);
     mx /= l;
     my /= l;
-    p.dvx = mx * PLAYER_SPEED * sprint * p.attr.speed; // pace scales with OVR
-    p.dvy = my * PLAYER_SPEED * sprint * p.attr.speed;
+    const tac = tacticMult(p);
+    p.dvx = mx * PLAYER_SPEED * sprint * p.attr.speed * tac.speed; // pace scales with OVR + tactic
+    p.dvy = my * PLAYER_SPEED * sprint * p.attr.speed * tac.speed;
     p.faceX = mx;
     p.faceY = my;
   } else {
@@ -1060,13 +1098,10 @@ function handleHumanInput(dt) {
     ball.owner.teamKey !== p.teamKey &&
     len(ball.owner.x - p.x, ball.owner.y - p.y) < STEAL_PROMPT_RANGE;
   const nearCarrier = byCarrier && p.lungeT <= 0 && p.lungeCd <= 0;
-  // Off the ball, left-click is a player switch: wind up the kick and flick it
-  // toward the teammate you want — control jumps to him on release.
-  const switchAim = !hasBall && !byCarrier && p.lungeT <= 0;
 
-  // Left-click is context-sensitive: charges a kick when you have the ball, a
-  // steal next to a carrier, or a switch-flick when you're off the ball.
-  if (mouseShoot && (hasBall || nearCarrier || switchAim)) {
+  // Left-click is context-sensitive: charges a kick when you have the ball, or a
+  // timed steal next to a carrier. Switching men off the ball is E, not the mouse.
+  if (mouseShoot && (hasBall || nearCarrier)) {
     charge += chargeDir * dt;
     if (charge >= CHARGE_TIME) { charge = CHARGE_TIME; chargeDir = -1; }
     else if (charge <= 0) { charge = 0; chargeDir = 1; }
@@ -1088,11 +1123,9 @@ function handleHumanInput(dt) {
       power > KICK_MIN + (KICK_MAX - KICK_MIN) * 0.55 ? Sfx.kick() : Sfx.pass();
     } else if (nearCarrier) {
       const t = charge / CHARGE_TIME;
-      const hw = stealGoldHalfWidth(p, ball.owner);
+      const hw = stealGoldHalfWidth(p, ball.owner) * tacticMult(p).tackle; // tactic widens/narrows the window
       const timingQuality = Math.max(0, 1 - Math.abs(t - STEAL_GOLD_CENTER) / hw);
       tryLunge(p, timingQuality);
-    } else {
-      switchTowardAim(p); // flicked the kick toward a teammate — take control of him
     }
     charge = 0;
     chargeDir = 1;
@@ -1262,7 +1295,7 @@ function clearPass() {
 // fails does the challenger's own tackle rating decide it.
 function stealSucceeds(carrier, challenger) {
   if (Math.random() < ovrGuard(carrier.ovr)) return false; // shrugged off
-  return Math.random() < Math.min(0.97, STEAL_CHANCE * challenger.attr.tackle);
+  return Math.random() < Math.min(0.97, STEAL_CHANCE * challenger.attr.tackle * tacticMult(challenger).tackle);
 }
 
 // ---------------------------------------------------------------------------
@@ -1430,7 +1463,7 @@ function moveToward(p, tx, ty, speed) {
     p.dvy = 0;
     return;
   }
-  const s = speed * p.attr.speed; // pace scales with the player's OVR
+  const s = speed * p.attr.speed * tacticMult(p).speed; // pace scales with OVR + your tactic
   p.dvx = (dx / l) * s;
   p.dvy = (dy / l) * s;
   p.faceX = dx / l;
@@ -1550,7 +1583,7 @@ function attackRunAI(p) {
   const push = isFullAI(p) ? 1.36 : 1.27;
   const lead =
     (p.role === "FWD" ? 188 : p.role === "MID" ? 106 : 26) * push;
-  let tx = h.x + p.dir * lead;
+  let tx = h.x + p.dir * lead + tacticShift(p);
   let ty = h.y + (ball.y - h.y) * 0.15;
   // don't bunch onto the goal line
   const goal = goalAttack(p.dir);
@@ -1568,7 +1601,7 @@ function defendAI(p) {
   const own = ownGoalX(p.dir);
   // Sit goal-side of the ball, holding formation height.
   const threat = clamp((own - ball.x) / (own - FIELD.cx || 1), 0, 1);
-  let tx = lerp(h.x, lerp(h.x, own + p.dir * 28, 0.6), threat);
+  let tx = lerp(h.x, lerp(h.x, own + p.dir * 28, 0.6), threat) + tacticShift(p);
   // shade toward the ball horizontally a touch
   tx = lerp(tx, ball.x, 0.12);
   let ty = h.y + (ball.y - h.y) * 0.22; // hold defensive width — less ball-tracking than before
@@ -1689,6 +1722,87 @@ function goalkeeperAI(p, dt) {
 // ---------------------------------------------------------------------------
 // Physics
 // ---------------------------------------------------------------------------
+// --- Anti-camping -----------------------------------------------------------
+// Keep play flowing: no outfielder may root to one spot, and neither 18-yard box
+// may become a parking lot. A player who hasn't moved CAMP_RADIUS in CAMP_LIMIT
+// seconds gets shoved back toward open shape; one who has squatted in a box for
+// BOX_LIMIT seconds is herded out to its edge. The keeper (the box is his job),
+// the player you're controlling, and whoever has the ball are exempt — they're
+// playing, not loitering. The push only has to move them CAMP_RADIUS to reset
+// the timer, so it's a short relocating jog, not a teleport.
+const CAMP_RADIUS = 20;  // staying within this of the anchor counts as "same spot"
+const CAMP_SCATTER = 42; // how far a loiterer is relocated (> CAMP_RADIUS so the anchor always resets)
+const CAMP_LIMIT = 4;    // seconds allowed on one spot
+const BOX_LIMIT = 8;     // seconds allowed inside a penalty box
+function inPenaltyBox(x, y) {
+  const nearGoal = Math.min(x - FIELD.left, FIELD.right - x) < PEN_BOX_DEPTH;
+  return nearGoal && Math.abs(y - FIELD.cy) < PEN_BOX_HALF;
+}
+function applyAntiCamp(dt) {
+  for (const p of players) {
+    // Exempt: keeper, your controlled man (human intent), and the ball carrier.
+    if (p.role === "GK" || p === ball.owner || (p === controlled && !autoPlay)) {
+      p.campX = p.x; p.campY = p.y; p.campT = 0; p.boxT = 0;
+      continue;
+    }
+    // Same-spot timer: reset the anchor (and clear any pending relocation) once
+    // they've drifted far enough on their own.
+    if (p.campX === undefined) { p.campX = p.x; p.campY = p.y; p.campT = 0; }
+    if (len(p.x - p.campX, p.y - p.campY) > CAMP_RADIUS) {
+      p.campX = p.x; p.campY = p.y; p.campT = 0; p.reloc = null;
+    } else {
+      p.campT = (p.campT || 0) + dt;
+    }
+    // Box timer.
+    p.boxT = inPenaltyBox(p.x, p.y) ? (p.boxT || 0) + dt : 0;
+
+    // Box overstay takes priority: sprint straight out of the box (shortest path
+    // along x). Cancel any committed lunge and briefly block a new one, else a
+    // chain-lunging defender in a goalmouth siege overrides the eviction (lunges
+    // are applied after this) and never actually leaves. Snap actual velocity to
+    // the escape vector too (like a lunge), so a player sprinting goalward reverses
+    // instantly instead of bleeding speed through the momentum ramp — that lag was
+    // what let a deep siege defender linger a second or two past the limit.
+    if (p.boxT > BOX_LIMIT) {
+      const nearLeft = (p.x - FIELD.left) < (FIELD.right - p.x);
+      const tx = nearLeft ? FIELD.left + PEN_BOX_DEPTH + 34 : FIELD.right - PEN_BOX_DEPTH - 34;
+      p.lungeT = 0;
+      p.lungeCd = Math.max(p.lungeCd || 0, 0.4);
+      moveToward(p, tx, p.y, AI_SPRINT * 1.6); // extra punch to clear a packed box
+      p.vx = p.dvx;
+      p.vy = p.dvy;
+      continue;
+    }
+    // Loitering on a spot: relocate. Pick ONE fixed scatter target the moment the
+    // limit trips and drive to it until the anchor resets — recomputing a target
+    // every frame let the player equilibrate on a boundary and jitter in place
+    // forever. Aim back toward formation home if they've drifted off it, else nudge
+    // out toward the ball's lane; always a clean ~CAMP_SCATTER px hop so they clear
+    // the anchor radius and the timer resets.
+    if (p.campT > CAMP_LIMIT) {
+      if (!p.reloc) {
+        const h = homePos(p.slot, p.dir);
+        const hx = h.x + tacticShift(p);
+        let dx, dy;
+        if (len(p.x - hx, p.y - h.y) > CAMP_RADIUS) {
+          dx = hx - p.x; dy = h.y - p.y;             // wandered off shape — go home
+        } else {
+          dx = (ball.x - p.x) * p.dir > 0 ? 1 : -1;  // at home — break toward the ball's side
+          dy = p.y < FIELD.cy ? 1 : -1;              // and off the line vertically
+          dx *= p.dir;
+        }
+        const l = len(dx, dy) || 1;
+        p.reloc = {
+          x: clamp(p.x + (dx / l) * CAMP_SCATTER, FIELD.left + 8, FIELD.right - 8),
+          y: clamp(p.y + (dy / l) * CAMP_SCATTER, FIELD.top + 8, FIELD.bottom - 8),
+        };
+      }
+      p.lungeT = 0;
+      moveToward(p, p.reloc.x, p.reloc.y, AI_SPRINT);
+    }
+  }
+}
+
 function integratePlayers(dt) {
   const maxStep = PLAYER_ACCEL * dt;
   for (const p of players) {
@@ -1734,7 +1848,7 @@ function applySpacing() {
       p.dvy += sy * SPACING_FORCE;
       // Don't let the spread push a player past a flat-out sprint.
       const l = len(p.dvx, p.dvy);
-      const cap = AI_SPRINT * p.attr.speed;
+      const cap = AI_SPRINT * p.attr.speed * tacticMult(p).speed;
       if (l > cap) {
         p.dvx = (p.dvx / l) * cap;
         p.dvy = (p.dvy / l) * cap;
@@ -1821,7 +1935,7 @@ function resolveSteals() {
     //        edge of gold zone = 0%. AI: existing ovrGuard + tackle formula.
     const isHuman = p.lungeTimingScore >= 0;
     const succeeded = isHuman
-      ? Math.random() < p.lungeTimingScore * STEAL_MAX_CHANCE
+      ? Math.random() < Math.min(0.95, p.lungeTimingScore * STEAL_MAX_CHANCE * tacticMult(p).tackle)
       : stealSucceeds(o, p);
     if (!succeeded) {
       ball.graceTimer = Math.max(ball.graceTimer, STEAL_FAIL_HOLD);
@@ -2033,12 +2147,12 @@ function render() {
     for (const p of players) drawPlayer(p);
     drawShotTracker();
     drawBall();
-    drawDefenseAim();
     drawHud();
   }
   drawOverlays();
   if (subOpen) drawSubMenu();
   drawPauseIconBar();
+  drawTacticBar();
   if (controlsOpen) drawControlsPanel();
   kitInputDone = false;
 }
@@ -2539,38 +2653,6 @@ function drawPlayer(p) {
   ctx.fillRect(Math.round(x + (p.faceX / fl) * 2), Math.round(y - 3 + (p.faceY / fl) * 1), 1, 1);
 }
 
-// Switch-flick aim preview: while you hold the meter off the ball, draw a dotted
-// line from your man toward the cursor and ring the teammate the flick would hand
-// control to — so you can see who you'll get before you let go.
-function drawDefenseAim() {
-  if (autoPlay || state !== STATE.PLAYING || !controlled) return;
-  if (!mouseShoot || charge <= 0) return;
-  const p = controlled;
-  const hasBall = ball.owner === p;
-  const byCarrier = !hasBall && ball.owner && ball.owner.teamKey !== p.teamKey &&
-    len(ball.owner.x - p.x, ball.owner.y - p.y) < STEAL_PROMPT_RANGE;
-  if (hasBall || byCarrier || p.lungeT > 0) return; // kick / steal / committed — not a switch
-  const a = aimVec(p);
-  const l = len(a.x, a.y) || 1;
-  const ux = a.x / l, uy = a.y / l;
-  // Dotted wind-up line in the aim direction.
-  for (let i = 1; i <= 15; i += 2) {
-    const d = i * 6;
-    ctx.fillStyle = "rgba(255,230,107,0.55)";
-    ctx.fillRect(Math.round(p.x + ux * d), Math.round(p.y + uy * d), 1, 1);
-  }
-  // Ring the man who'd be selected — the one under the cursor if you're on one,
-  // else the man the flick points at.
-  const target = switchPick(p);
-  if (target) {
-    ctx.strokeStyle = "rgba(255,230,107,0.9)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.ellipse(target.x, target.y + 3, PLAYER_R + 2, (PLAYER_R + 2) * 0.5, 0, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-}
-
 function drawBall() {
   // Magnet attraction visuals: receiver ring pulse + ball trail. This is a
   // human player-assist cue, so it's hidden in AUTOPLAY (AI vs AI) — there's no
@@ -2652,6 +2734,23 @@ function drawHud() {
   const clkW = textWidth(clockStr, 1);
   const clkX = lx + kitW + 3 + lW + GAP + Math.floor((sW - clkW) / 2);
   drawText(ctx, clockStr, clkX, ly + 13, 1, clockColor);
+
+  // Secret luck swing, shown right under each team's abbreviation. Green = lucky
+  // (playing above their real rating today), red = unlucky, grey = dead average.
+  // Only in real-OVR (squad) matches — classic BRA-vs-ARG has no luck so it
+  // stays clean. The swing maps to whichever team sits in each scoreboard slot
+  // (slots flip on a road game).
+  if (isSquadMatch) {
+    const homeSlotLuck = flip ? luckR : luckL;
+    const awaySlotLuck = flip ? luckL : luckR;
+    const luckStr = (v) => (v > 0 ? "+" + v : "" + v); // "+10" / "-7" / "0"
+    const luckColor = (v) => (v > 0 ? "#5ee08a" : v < 0 ? "#ff6b6b" : "#8fa6c4");
+    const luckY = ly + 13; // a row below the abbreviations
+    const homeAbbrX = lx + kitW + 3;
+    const awayAbbrX = lx + kitW + 3 + lW + GAP + sW + GAP;
+    drawText(ctx, luckStr(homeSlotLuck), homeAbbrX, luckY, 1, luckColor(homeSlotLuck));
+    drawText(ctx, luckStr(awaySlotLuck), awayAbbrX, luckY, 1, luckColor(awaySlotLuck));
+  }
 
   // Confederation badge, same height as the score block, immediately to its
   // right — only during a Road-to-the-World-Cup qualifier (AFC, CAF, ...).
@@ -2889,6 +2988,88 @@ function pibDrawChevronRight(bx, by, col) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Tactic bar — bottom-left, same 20px pixel buttons as the top-right icon bar.
+// Three modes (defend «  ·  balanced –  ·  attack ») toggled by clicking a
+// button or pressing 1 / 2 / 3. The active mode is inverted like the icon bar.
+// ---------------------------------------------------------------------------
+const TB = { btnW: SB_H, btnH: SB_H, gap: 2, count: 3, margin: 4 };
+TB.fullW = TB.count * TB.btnW + (TB.count - 1) * TB.gap;
+TB.x = TB.margin;
+TB.y = VIEW_H - TB.margin - TB.btnH;
+
+function tbRect(i) {
+  return { x: TB.x + i * (TB.btnW + TB.gap), y: TB.y };
+}
+
+// Returns true if the click landed on the tactic bar (and switched mode).
+function tbHandleClick(cx, cy) {
+  if (state !== STATE.PLAYING) return false;
+  for (let i = 0; i < TB.count; i++) {
+    const r = tbRect(i);
+    if (cx >= r.x && cx < r.x + TB.btnW && cy >= r.y && cy < r.y + TB.btnH) {
+      setTactic(i);
+      return true;
+    }
+  }
+  return false;
+}
+
+function drawTacticBar() {
+  if (state !== STATE.PLAYING) return;
+  drawText(ctx, TACTIC_LABEL[tactic], TB.x, TB.y - 9, 1, TACTIC_COLOR[tactic]);
+  for (let i = 0; i < TB.count; i++) {
+    const r = tbRect(i);
+    const bx = r.x, by = r.y;
+    const hover = mouseActive && mouseX >= bx && mouseX < bx + TB.btnW && mouseY >= by && mouseY < by + TB.btnH;
+    const active = i === tactic;
+    pibBtn(bx, by, active, hover); // reuse the icon-bar button chrome
+    const ic = active ? "#000000" : "#ffffff";
+    if (i === 0) tacDrawDefend(bx, by, ic);
+    else if (i === 1) tacDrawNeutral(bx, by, ic);
+    else tacDrawAttack(bx, by, ic);
+  }
+  // Small box to the bottom-right of the bar showing changes remaining. Dims
+  // out once you've used all five for the match.
+  const cs = 12; // box side — smaller than the 20px mode buttons
+  const cbx = TB.x + TB.fullW + TB.gap;
+  const cby = TB.y + TB.btnH - cs; // bottom-aligned with the mode buttons
+  const out = tacticChangesLeft <= 0;
+  ctx.fillStyle = "#000000";
+  ctx.fillRect(cbx, cby, cs, cs);
+  ctx.fillStyle = out ? "#5a3030" : "#3a4a66";
+  ctx.fillRect(cbx, cby, cs, 1);
+  ctx.fillRect(cbx, cby + cs - 1, cs, 1);
+  ctx.fillRect(cbx, cby, 1, cs);
+  ctx.fillRect(cbx + cs - 1, cby, 1, cs);
+  const num = String(tacticChangesLeft);
+  drawText(ctx, num, cbx + Math.round((cs - textWidth(num, 1)) / 2), cby + 4, 1, out ? "#ff6b6b" : "#ffffff");
+}
+
+// A 2px-thick chevron: vertex at (vx,vy); dir -1 points left "<", +1 points right ">".
+function tacChevron(vx, vy, dir, col) {
+  ctx.fillStyle = col;
+  for (let r = 0; r <= 3; r++) {
+    const x = vx - dir * r;
+    ctx.fillRect(x, vy - r, 2, 1);
+    ctx.fillRect(x, vy + r, 2, 1);
+  }
+}
+function tacDrawDefend(bx, by, col) {
+  const cy = by + 10;
+  tacChevron(bx + 5, cy, -1, col);
+  tacChevron(bx + 10, cy, -1, col);
+}
+function tacDrawAttack(bx, by, col) {
+  const cy = by + 10;
+  tacChevron(bx + 9, cy, 1, col);
+  tacChevron(bx + 14, cy, 1, col);
+}
+function tacDrawNeutral(bx, by, col) {
+  ctx.fillStyle = col;
+  ctx.fillRect(bx + 5, by + 9, 10, 2);
+}
+
 // Controls reference panel (drawn in top-right when controlsOpen).
 function drawControlsPanel() {
   const panW = 172, panX = VIEW_W - PIB.margin - panW, panY = PIB.y + PIB.btnH + 3;
@@ -2896,8 +3077,9 @@ function drawControlsPanel() {
     ["MOVE", "WASD / ARROWS"],
     ["AIM", "MOUSE"],
     ["KICK / TACKLE", "HOLD LMB"],
-    ["SWITCH MAN", "CLICK / E"],
+    ["SWITCH MAN", "E"],
     ["SPRINT", "SHIFT"],
+    ["TACTIC", "1 / 2 / 3"],
     ["PAUSE", "P / ESC"],
     ["SUBS", "B"],
   ];
@@ -3024,10 +3206,10 @@ function drawOverlays() {
     const stealMode = ball.owner && ball.owner !== controlled &&
       ball.owner.teamKey !== controlled.teamKey &&
       len(ball.owner.x - controlled.x, ball.owner.y - controlled.y) < STEAL_PROMPT_RANGE;
-    // A switch-flick (off the ball, not next to a carrier) shows an aim line
-    // instead of a power bar — see drawDefenseAim — so skip the meter here.
-    const switchMode = ball.owner !== controlled && !stealMode;
-    if (!switchMode) {
+    // Meter only shows for the two charged actions: kicking (you have the ball)
+    // or a timed steal next to a carrier.
+    const showMeter = stealMode || ball.owner === controlled;
+    if (showMeter) {
       ctx.fillStyle = "rgba(0,0,0,0.5)";
       ctx.fillRect(bx - 1, by - 1, barW + 2, 4);
       if (stealMode) {
@@ -3072,11 +3254,6 @@ function drawOverlays() {
     drawTextCentered(ctx, setpieceLabel, VIEW_W / 2, 30, 2, "#ffe66b");
   }
 
-  // In-match substitutions hint (squad matches only).
-  if (state === STATE.PLAYING && !paused && !subOpen && FEATURE.teamSelect && hasSquads()) {
-    const left = subsUsedL < MAX_SUBS ? `B  SUBS (${MAX_SUBS - subsUsedL})` : "NO SUBS LEFT";
-    drawText(ctx, left, 6, VIEW_H - 10, 1, "rgba(205,217,240,0.55)");
-  }
 }
 
 function dim(a) {
@@ -3898,7 +4075,11 @@ window.__wcj = {
     return [...keys];
   },
   positions() {
-    return players.map((p) => ({ t: p.teamKey, r: p.role, x: Math.round(p.x), y: Math.round(p.y) }));
+    return players.map((p) => ({
+      t: p.teamKey, r: p.role, x: Math.round(p.x), y: Math.round(p.y),
+      ct: Math.round((p.campT || 0) * 100) / 100, // seconds loitering on one spot
+      bt: Math.round((p.boxT || 0) * 100) / 100,   // seconds inside a penalty box
+    }));
   },
   start() {
     setupMatch(); // force a clean match (used by tests)
@@ -3982,6 +4163,17 @@ window.__wcj = {
       lOvr: hasSquads() ? teamOvr(leftKey) : null,
       rOvr: hasSquads() ? teamOvr(rightKey) : null,
       subsLeft: hasSquads() ? MAX_SUBS - subsUsedL : null,
+    };
+  },
+  // The current match's SECRET luck swing + the effective (real + luck) OVR the
+  // live players actually carry. Real OVR stays the displayed rating; this is
+  // only for verification.
+  get luck() {
+    return {
+      l: luckL,
+      r: luckR,
+      lEff: left && left[0] ? left[0].ovr : 0,
+      rEff: right && right[0] ? right[0].ovr : 0,
     };
   },
   // Jump straight into a squad match (used by tests / quick verification).
