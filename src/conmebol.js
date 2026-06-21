@@ -27,12 +27,24 @@ function roundRobin(n, double) {
   if (arr.length % 2 === 1) arr.push(-1);
   const m = arr.length;
   const rounds = [];
+  // Even home/away split: give each match to whichever side has hosted least so
+  // far (tie-break: whoever has travelled more). The plain circle method handed
+  // the last seed every single game away — which is why a road campaign always
+  // felt like it was played away from home.
+  const home = new Array(n).fill(0);
+  const away = new Array(n).fill(0);
   for (let r = 0; r < m - 1; r++) {
     const day = [];
     for (let i = 0; i < m / 2; i++) {
       const a = arr[i], b = arr[m - 1 - i];
       if (a === -1 || b === -1) continue;
-      day.push(r % 2 === 0 ? [a, b] : [b, a]);
+      let h;
+      if (home[a] !== home[b]) h = home[a] < home[b] ? a : b;
+      else if (away[a] !== away[b]) h = away[a] > away[b] ? a : b;
+      else h = r % 2 === 0 ? a : b;
+      const w = h === a ? b : a;
+      home[h]++; away[w]++;
+      day.push([h, w]);
     }
     rounds.push(day);
     arr.splice(1, 0, arr.pop());

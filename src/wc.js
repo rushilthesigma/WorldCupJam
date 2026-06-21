@@ -2068,7 +2068,7 @@ export function createWorldCup(hooks) {
       directCount: q.qualifiedDirect.length,
       reps: (q.icpReps || []).slice(),
       icpWinners: ctrl.icp && ctrl.icp.done ? ctrl.icp.winners.slice() : null,
-      fixture: f ? { you: f.youKey, opp: f.oppKey, kind: f.kind, label: f.label } : null,
+      fixture: f ? { you: f.youKey, opp: f.oppKey, kind: f.kind, label: f.label, home: f.a === f.youKey } : null,
       tournamentReady: !!ctrl.t,
       tournamentYou: ctrl.t ? ctrl.t.youKey : null,
     };
